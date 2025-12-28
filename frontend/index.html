@@ -1187,7 +1187,7 @@
             <!-- Theme Toggle -->
             <button @click="$store.workflow.toggleTheme()"
                 class="p-2 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-slate-700 transition-colors"
-                title="Toggle Theme">
+                title="Toggle Theme" aria-label="Toggle Dark Mode">
                 <svg x-show="$store.workflow.theme === 'light'" xmlns="http://www.w3.org/2000/svg" width="20"
                     height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round">
@@ -1517,7 +1517,7 @@
         <!-- Zoom Controls -->
         <div
             class="absolute bottom-6 left-6 z-40 bg-white/90 backdrop-blur-md rounded-xl shadow-lg border border-gray-200 p-1 flex items-center gap-1">
-            <button @click="$store.workflow.setZoom($store.workflow.zoom - 0.1)"
+            <button @click="$store.workflow.setZoom($store.workflow.zoom - 0.1)" aria-label="Zoom Out"
                 class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Zoom Out">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1526,7 +1526,7 @@
             </button>
             <span class="text-xs font-mono font-medium text-gray-500 w-12 text-center"
                 x-text="Math.round($store.workflow.zoom * 100) + '%'"></span>
-            <button @click="$store.workflow.setZoom($store.workflow.zoom + 0.1)"
+            <button @click="$store.workflow.setZoom($store.workflow.zoom + 0.1)" aria-label="Zoom In"
                 class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Zoom In">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

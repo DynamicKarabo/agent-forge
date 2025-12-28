@@ -105,5 +105,5 @@ Simply connect your repository and set the `GROQ_API_KEY` environment variable. 
 
 ---
 
-**built with ❤️ by You**
+**built with ❤️ by Karabo**
 >>>>>>> b5c3553 (Initial Release v1.0)
