@@ -2,6 +2,7 @@ from fastapi import FastAPI, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from .models import RunRequest, Workflow, Node
+from pydantic import BaseModel
 from .agents import Agent, AGENT_PROMPTS
 import json
 import asyncio
@@ -16,6 +17,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class RunNodeRequest(BaseModel):
+    agent_config: dict
+    history: List[Dict[str, str]]
+    prompt: str
+
+@app.post("/run_node")
+async def run_single_node(request: RunNodeRequest = Body(...)):
+    """
+    Executes a single agent node.
+    Streams logs and final result/thought.
+    """
+    agent_data = request.agent_config
+    agent_name = agent_data.get("name", "Unknown")
+    system_prompt = agent_data.get("system_prompt", "")
+    history = request.history
+    
+    async def event_generator():
+        # yield f"event: log\ndata: {json.dumps({'agent': 'System', 'text': f'Activating {agent_name}...', 'type': 'info'})}\n\n"
+
+        agent = Agent(name=agent_name, system_prompt=system_prompt)
+        
+        # Pruning
+        pruned_history = history[-10:] if len(history) > 10 else history
+
+        full_response = ""
+        try:
+             async for event in agent.run_stream(pruned_history):
+                if event["type"] == "thought":
+                    chunk = event["text"]
+                    full_response += chunk
+                    sse_payload = json.dumps({
+                        "agent": agent_name,
+                        "text": chunk,
+                        "type": "thought"
+                    })
+                    yield f"event: log\ndata: {sse_payload}\n\n"
+                elif event["type"] == "error":
+                     yield f"event: log\ndata: {json.dumps({'agent': 'System', 'text': event['text'], 'type': 'error'})}\n\n"
+        except Exception as e:
+             yield f"event: log\ndata: {json.dumps({'agent': 'System', 'text': f'Error details: {str(e)}', 'type': 'error'})}\n\n"
+             yield f"event: end\ndata: {json.dumps({'status': 'error'})}\n\n"
+             return
+
+        # Return final content event so frontend can append to history
+        yield f"event: end\ndata: {json.dumps({'status': 'success', 'content': full_response})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.post("/run")
 async def run_workflow(request: RunRequest = Body(...)):

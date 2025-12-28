@@ -3,10 +3,26 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>AgentForge - Visual Agent Workflow Builder</title>
     <meta name="description" content="Build and execute multi-agent AI workflows visually.">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        slate: { 850: '#1e293b' } // Custom dark shade if needed
+                    },
+                    checkbox: {
+                        // Tailwind forms plugin might be needed for perfect checkboxes, 
+                        // but standard styling is fine for now.
+                    }
+                }
+            }
+        }
+    </script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.3/dist/cdn.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@jsplumb/browser-ui@5.13.4/js/jsplumb.browser-ui.umd.min.js"></script>
     <style>
@@ -51,6 +67,16 @@
             background-image:
                 linear-gradient(to right, rgba(99, 102, 241, 0.05) 1px, transparent 1px),
                 linear-gradient(to bottom, rgba(99, 102, 241, 0.05) 1px, transparent 1px);
+            transform-origin: 0 0;
+        }
+
+        #canvas-layer {
+            transform-origin: 0 0;
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
         }
 
         .typing-dot {
@@ -93,28 +119,144 @@
         .animate-fade-in-up {
             animation: fadeInUp 0.3s ease-out forwards;
         }
+
+        .toast-enter {
+            opacity: 0;
+            transform: translateY(20px);
+        }
+
+        .toast-enter-active {
+            opacity: 1;
+            transform: translateY(0);
+            transition: all 0.3s ease-out;
+        }
+
+        .toast-leave {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .toast-leave-active {
+            opacity: 0;
+            transform: translateY(-20px);
+            transition: all 0.3s ease-in;
+        }
+
+        /* Port Styles */
+        .port {
+            width: 12px;
+            height: 12px;
+            background-color: #6366f1;
+            /* Indigo-500 */
+            border-radius: 50%;
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            cursor: crosshair;
+            z-index: 30;
+            transition: transform 0.2s, background-color 0.2s;
+            border: 2px solid white;
+            box-shadow: 0 0 0 1px #cbd5e1;
+        }
+
+        .port:hover {
+            transform: translateY(-50%) scale(1.3);
+            background-color: #4f46e5;
+            /* Indigo-600 */
+        }
+
+        .port.input {
+            left: -6px;
+        }
+
+        .port.output {
+            right: -6px;
+        }
+
+        .jtk-drag {
+            opacity: 0.8;
+            cursor: grabbing;
+        }
     </style>
     <script>
         document.addEventListener('alpine:init', () => {
             Alpine.store('workflow', {
-                nodes: [],
-                edges: [],
-                logs: [],
-                prompt: '',
+                selectedNode: null,
+                selectedEdge: null,
+                showDeleteConfirm: false,
+                itemToDelete: null,
+                showConfigPanel: false,
+                editingNode: null,
+
+                // Persistence & Validation
+                notifications: [],
+                recentWorkflows: [],
+                validationStatus: { valid: true, issues: [] },
+                showValidationPanel: false,
+
+                // Theme & Onboarding
+                theme: localStorage.getItem('agentforge_theme') || 'light',
+                showWelcome: !localStorage.getItem('agentforge_onboarded'),
+
+                // Shortcuts & History
+                showShortcuts: false,
+                history: [],
+                future: [],
+                isUndoRedo: false, // Flag to prevent recording during undo/redo
+
+                // Execution State
                 isRunning: false,
-                reportContent: '',
-                instance: null,
+                isPaused: false,
+                stepMode: false,
+                activeNodeId: null,
+                executionQueue: [],
+                executionHistory: [], // [{ role: 'user', content: '...' }, { role: 'assistant', content: '...' }]
+                currentStep: 0,
+                totalSteps: 0,
+
+                // Canvas Navigation
+                zoom: 1,
+                pan: { x: 0, y: 0 },
+                isPanning: false,
+                lastMousePos: { x: 0, y: 0 },
 
                 init() {
+                    const self = this;
+                    // Fix: Ensure jsPlumb uses our layer as container
                     this.instance = jsPlumbBrowserUI.newInstance({
-                        container: document.getElementById("canvas"),
-                        dragOptions: { cursor: 'grab' },
+                        container: document.getElementById("canvas-layer"),
+                        dragOptions: {
+                            cursor: 'grab',
+                            grid: [20, 20] // Snap to grid
+                        },
                         connectionOverlays: [
                             { type: "Arrow", options: { location: 1, width: 10, length: 10, fill: "#6366f1" } }
                         ],
                         connector: { type: "Bezier", options: { curviness: 50 } },
+                        // Dynamic paint style in code is tricky with jsPlumb, usually set on connect
+                        // We will set defaults, but might need to updating for dark mode refresh
                         paintStyle: { stroke: "#6366f1", strokeWidth: 2 },
-                        endpointStyle: { fill: "#6366f1", radius: 4 }
+                        hoverPaintStyle: { stroke: "#4f46e5", strokeWidth: 3 },
+                        endpoint: "Blank" // We use custom div ports
+                    });
+
+                    // Apply initial theme
+                    if (this.theme === 'dark') document.documentElement.classList.add('dark');
+                    else document.documentElement.classList.remove('dark');
+
+                    // Connection Interceptor (Strict Rules)
+                    this.instance.bind("beforeDrop", (info) => {
+                        const source = info.sourceId;
+                        const target = info.targetId;
+
+                        // Prevent self-loops
+                        if (source === target) return false;
+
+                        // Prevent duplicate connections
+                        const existing = this.edges.find(e => e.source === source && e.target === target);
+                        if (existing) return false;
+
+                        return true;
                     });
 
                     this.instance.bind("connection", (info) => {
@@ -125,19 +267,262 @@
                         this.removeEdge(info.sourceId, info.targetId);
                     });
 
-                    // Load Demo on first visit
+                    // Edge Click -> Select
+                    this.instance.bind("click", (component, event) => {
+                        if (component.sourceId) { // It's a connection
+                            this.selectEdge(component.sourceId, component.targetId);
+                            // Stop propagation manually if needed, but clicking canvas clears it
+                            event.stopPropagation();
+                        }
+                    });
+
+                    // Set initial Zoom
+                    this.instance.setZoom(this.zoom);
+
+                    // Load Recent or Demo
+                    this.loadRecentList();
+                    const saved = localStorage.getItem('agentforge_autosave');
+
                     setTimeout(() => {
-                        if (this.nodes.length === 0) {
+                        if (saved) {
+                            try {
+                                const data = JSON.parse(saved);
+                                // Only auto-load if valid and < 1 hour old? 
+                                // For now, if users visited recently, restore.
+                                this.loadData(data);
+                                this.notify("Restored previous session");
+                            } catch (e) { console.error("Autosave load failed", e); this.loadDemo(); }
+                        } else if (this.nodes.length === 0) {
                             this.loadDemo();
+                            this.centerCanvas();
                         }
                     }, 100);
+
+                    // Auto-Save Interval
+                    setInterval(() => { this.autoSave(); }, 30000);
+
+                    // Validation Watcher
+                    this.$watch('nodes', () => this.validateWorkflow());
+                    this.$watch('edges', () => this.validateWorkflow());
+                },
+
+                // History & Undo/Redo
+                record(action) {
+                    if (this.isUndoRedo) return;
+                    this.history.push(action);
+                    if (this.history.length > 50) this.history.shift();
+                    this.future = []; // Clear future on new action
+                },
+
+                undo() {
+                    if (this.history.length === 0) return;
+                    const action = this.history.pop();
+                    this.future.push(action);
+                    this.isUndoRedo = true;
+                    this.applyReverse(action);
+                    this.isUndoRedo = false;
+                    this.notify("Undid last action", "info");
+                },
+
+                redo() {
+                    if (this.future.length === 0) return;
+                    const action = this.future.pop();
+                    this.history.push(action);
+                    this.isUndoRedo = true;
+                    this.applyAction(action);
+                    this.isUndoRedo = false;
+                    this.notify("Redid action", "info");
+                },
+
+                applyAction(action) {
+                    switch (action.type) {
+                        case 'add-node': this.addNode(action.node.type, action.node); break;
+                        case 'del-node': this.removeNode(action.node.id); break;
+                        case 'add-edge': this.addEdge(action.source, action.target, true); break;
+                        case 'del-edge': this.removeEdge(action.source, action.target); break;
+                        // case 'move-node': ... (Complex, maybe skip for now or implement robustly)
+                    }
+                },
+
+                applyReverse(action) {
+                    switch (action.type) {
+                        case 'add-node': this.removeNode(action.node.id); break;
+                        case 'del-node': this.restoreNode(action.node, action.edges); break;
+                        case 'add-edge': this.removeEdge(action.source, action.target); break;
+                        case 'del-edge': this.addEdge(action.source, action.target, true); break;
+                    }
+                },
+
+                restoreNode(node, edges) {
+                    this.nodes.push(node);
+                    this.$nextTick(() => {
+                        this.setupNode(node.id);
+                        // Restore edges
+                        edges.forEach(e => this.addEdge(e.source, e.target, true));
+                    });
+                },
+
+                // Notifications
+                notify(message, type = 'success') {
+                    const id = Date.now();
+                    this.notifications.push({ id, message, type });
+                    setTimeout(() => {
+                        this.notifications = this.notifications.filter(n => n.id !== id);
+                    }, 3000);
+                },
+
+                toggleTheme() {
+                    this.theme = this.theme === 'light' ? 'dark' : 'light';
+                    localStorage.setItem('agentforge_theme', this.theme);
+                    if (this.theme === 'dark') document.documentElement.classList.add('dark');
+                    else document.documentElement.classList.remove('dark');
+                },
+
+                finishOnboarding() {
+                    this.showWelcome = false;
+                    localStorage.setItem('agentforge_onboarded', 'true');
+                    this.notify("Welcome to AgentForge!");
+                },
+
+                // Validation Logic
+                validateWorkflow() {
+                    const issues = [];
+
+                    if (this.nodes.length === 0) {
+                        // Empty graph is valid state? Maybe not for running.
+                        // Let's assume valid but not runnable.
+                    } else {
+                        // Check Connectivity
+                        this.nodes.forEach(node => {
+                            const incoming = this.edges.filter(e => e.target === node.id);
+                            const outgoing = this.edges.filter(e => e.source === node.id);
+
+                            // Start Node Heuristic: The one with no incoming? 
+                            // Or just warn generally if NO incoming and NO outgoing (Isolated)
+                            if (incoming.length === 0 && outgoing.length === 0 && this.nodes.length > 1) {
+                                issues.push({ id: node.id, level: 'error', message: `${node.type} is isolated.` });
+                            } else if (incoming.length === 0) {
+                                // Potential Start Node. If prompt is empty, might be issue?
+                            } else if (outgoing.length === 0) {
+                                issues.push({ id: node.id, level: 'warning', message: `${node.type} is a dead end.` });
+                            }
+                        });
+
+                        // Check Loops? (jsPlumb prevents direct self-loops, but cycles possible)
+                    }
+
+                    this.validationStatus = {
+                        valid: issues.filter(i => i.level === 'error').length === 0,
+                        issues
+                    };
+                },
+
+                // Persistence Logic
+                autoSave() {
+                    const data = this.getWorkflowData();
+                    localStorage.setItem('agentforge_autosave', JSON.stringify(data));
+                    // Don't notify on autosave to avoid spam, maybe small indicator?
+                },
+
+                loadRecentList() {
+                    try {
+                        this.recentWorkflows = JSON.parse(localStorage.getItem('agentforge_recent') || '[]');
+                    } catch (e) { this.recentWorkflows = []; }
+                },
+
+                addToRecent(name) {
+                    this.recentWorkflows = [{ name, date: new Date().toISOString() }, ...this.recentWorkflows.filter(r => r.name !== name)].slice(0, 5);
+                    localStorage.setItem('agentforge_recent', JSON.stringify(this.recentWorkflows));
+                },
+
+                getWorkflowData() {
+                    return {
+                        nodes: this.nodes,
+                        edges: this.edges,
+                        prompt: this.prompt,
+                        pan: this.pan,
+                        zoom: this.zoom,
+                        timestamp: Date.now()
+                    };
+                },
+
+                loadData(data) {
+                    this.clearCanvas();
+                    this.prompt = data.prompt || "";
+                    if (data.pan) this.pan = data.pan;
+                    if (data.zoom) this.setZoom(data.zoom);
+
+                    data.nodes.forEach((n) => {
+                        this.nodes.push(n);
+                        this.$nextTick(() => { this.setupNode(n.id); });
+                    });
+
+                    setTimeout(() => {
+                        data.edges.forEach(e => {
+                            // Robust connection restore
+                            const src = document.querySelector(`#${e.source} .output`);
+                            const tgt = document.querySelector(`#${e.target} .input`);
+                            if (src && tgt) {
+                                this.instance.connect({ source: src, target: tgt });
+                            }
+                        });
+                        this.validateWorkflow();
+                    }, 300);
+                },
+
+                // Navigation Logic
+                startPan(e) {
+                    if (e.button === 0 && e.code === 'Space' || e.button === 1) { // Middle click or Space+Left
+                        this.isPanning = true;
+                        this.lastMousePos = { x: e.clientX, y: e.clientY };
+                        e.preventDefault();
+                    }
+                },
+
+                doPan(e) {
+                    if (!this.isPanning) return;
+                    const dx = e.clientX - this.lastMousePos.x;
+                    const dy = e.clientY - this.lastMousePos.y;
+                    this.pan.x += dx;
+                    this.pan.y += dy;
+                    this.lastMousePos = { x: e.clientX, y: e.clientY };
+                },
+
+                endPan() {
+                    this.isPanning = false;
+                },
+
+                handleWheel(e) {
+                    if (e.ctrlKey || e.metaKey) {
+                        e.preventDefault();
+                        const delta = e.deltaY > 0 ? -0.1 : 0.1;
+                        this.setZoom(this.zoom + delta);
+                    }
+                },
+
+                setZoom(val) {
+                    this.zoom = Math.min(Math.max(val, 0.5), 1.5);
+                    this.instance.setZoom(this.zoom);
+                },
+
+                centerCanvas() {
+                    this.pan = { x: 0, y: 0 };
+                    this.setZoom(1);
                 },
 
                 loadDemo() {
+                    const icons = {
+                        'Researcher': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
+                        'Writer': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>`,
+                        'Critic': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path><line x1="9" y1="9" x2="15" y2="15"></line><line x1="15" y1="9" x2="9" y2="15"></line></svg>`,
+                        'Coder': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>`
+                    };
+
                     const demoNodes = [
-                        { id: 'node-1', type: 'Researcher', x: 100, y: 100, data: { color: 'bg-indigo-50 border-indigo-200', icon: '🔍', text: 'text-indigo-700', system_prompt: 'You are a Senior Researcher. Find data on 2026 EV Market trends in South Africa.' } },
-                        { id: 'node-2', type: 'Writer', x: 450, y: 100, data: { color: 'bg-teal-50 border-teal-200', icon: '✍️', text: 'text-teal-700', system_prompt: 'Use the research to write a market analysis report.' } },
-                        { id: 'node-3', type: 'Critic', x: 450, y: 350, data: { color: 'bg-amber-50 border-amber-200', icon: '🧐', text: 'text-amber-700', system_prompt: 'Review the report for clarity and accuracy.' } }
+                        { id: 'node-1', type: 'Researcher', x: 100, y: 100, data: { color: 'bg-indigo-50 border-indigo-200 dark:bg-slate-800 dark:border-indigo-900', icon: icons['Researcher'], text: 'text-indigo-700 dark:text-indigo-300', system_prompt: 'You are a Senior Researcher. Find data on 2026 EV Market trends in South Africa.' } },
+                        { id: 'node-2', type: 'Writer', x: 500, y: 100, data: { color: 'bg-teal-50 border-teal-200 dark:bg-slate-800 dark:border-teal-900', icon: icons['Writer'], text: 'text-teal-700 dark:text-teal-300', system_prompt: 'Use the research to write a market analysis report.' } },
+                        { id: 'node-3', type: 'Critic', x: 500, y: 400, data: { color: 'bg-amber-50 border-amber-200 dark:bg-slate-800 dark:border-amber-900', icon: icons['Critic'], text: 'text-amber-700 dark:text-amber-300', system_prompt: 'Review the report for clarity and accuracy.' } },
+                        { id: 'node-4', type: 'Coder', x: 900, y: 250, data: { color: 'bg-violet-50 border-violet-200 dark:bg-slate-800 dark:border-violet-900', icon: icons['Coder'], text: 'text-violet-700 dark:text-violet-300', system_prompt: 'Format the final report as Markdown.' } }
                     ];
 
                     this.clearCanvas();
@@ -146,76 +531,216 @@
                     // Add nodes sequentially to allow DOM render
                     demoNodes.forEach((n, index) => {
                         this.nodes.push(n);
-                        setTimeout(() => {
-                            const el = document.getElementById(n.id);
-                            this.instance.manage(el);
-                            this.instance.addEndpoint(el, { source: true, target: false, anchor: "Right" });
-                            this.instance.addEndpoint(el, { source: false, target: true, anchor: "Left" });
+                        this.$nextTick(() => { this.setupNode(n.id); });
+                    });
 
-                            // Connect them after nodes exist
-                            if (index > 0) {
-                                this.instance.connect({ source: demoNodes[index - 1].id, target: n.id });
-                            }
-                        }, 50 * (index + 1));
+                    // Connect after all nodes are ready
+                    setTimeout(() => {
+                        this.addEdge('node-1', 'node-2'); this.instance.connect({ source: document.querySelector('#node-1 .output'), target: document.querySelector('#node-2 .input') });
+                        this.addEdge('node-2', 'node-3'); this.instance.connect({ source: document.querySelector('#node-2 .output'), target: document.querySelector('#node-3 .input') });
+                        this.addEdge('node-3', 'node-4'); this.instance.connect({ source: document.querySelector('#node-3 .output'), target: document.querySelector('#node-4 .input') });
+                        this.validateWorkflow();
+                    }, 300);
+                },
+
+                addNode(type, existingNode = null) {
+                    let node;
+                    if (existingNode) {
+                        node = existingNode;
+                        this.nodes.push(node);
+                    } else {
+                        const id = `node-${Date.now()}`;
+                        // Auto-positioning logic
+                        let startX = 100;
+                        let startY = 100;
+                        if (this.nodes.length > 0) {
+                            // First node center-ish relative to current pan? 
+                            // Actually just keeping 100,100 makes sense for 0,0 origin
+                        }
+
+                        const icons = {
+                            'Researcher': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
+                            'Writer': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>`,
+                            'Critic': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path><line x1="9" y1="9" x2="15" y2="15"></line><line x1="15" y1="9" x2="9" y2="15"></line></svg>`,
+                            'Coder': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>`
+                        };
+
+                        const def = {
+                            'Researcher': { color: 'bg-indigo-50 border-indigo-200 dark:bg-slate-800 dark:border-indigo-900', icon: icons['Researcher'], text: 'text-indigo-700 dark:text-indigo-300', system: 'You are a researcher. Search for detailed information.' },
+                            'Writer': { color: 'bg-teal-50 border-teal-200 dark:bg-slate-800 dark:border-teal-900', icon: icons['Writer'], text: 'text-teal-700 dark:text-teal-300', system: 'You are a writer. Create engaging content based on research.' },
+                            'Critic': { color: 'bg-amber-50 border-amber-200 dark:bg-slate-800 dark:border-amber-900', icon: icons['Critic'], text: 'text-amber-700 dark:text-amber-300', system: 'You are a critic. Review and improve the content.' },
+                            'Coder': { color: 'bg-violet-50 border-violet-200 dark:bg-slate-800 dark:border-violet-900', icon: icons['Coder'], text: 'text-violet-700 dark:text-violet-300', system: 'You are a coder. Generate high-quality code.' }
+                        }[type];
+
+                        node = { id, type, x: startX, y: startY, data: { system_prompt: def.system, ...def } };
+                        this.nodes.push(node);
+                        this.record({ type: 'add-node', node: JSON.parse(JSON.stringify(node)) });
+                    }
+
+                    this.$nextTick(() => { this.setupNode(node.id); });
+                },
+
+                setupNode(id) {
+                    const el = document.getElementById(id);
+                    const inputPort = el.querySelector('.input');
+                    const outputPort = el.querySelector('.output');
+
+                    this.instance.manage(el);
+
+                    // Configure Ports
+                    this.instance.makeSource(outputPort, {
+                        filter: ".port",
+                        anchor: "Continuous",
+                        connectionType: "basic"
+                    });
+
+                    this.instance.makeTarget(inputPort, {
+                        anchor: "Continuous",
+                        allowLoopback: false
                     });
                 },
 
-                addNode(type) {
-                    const id = `node-${Date.now()}`;
-                    const offset = 50 + (this.nodes.length * 20);
-                    const def = {
-                        'Researcher': { color: 'bg-indigo-50 border-indigo-200', icon: '🔍', text: 'text-indigo-700', system: 'You are a researcher. Search for detailed information.' },
-                        'Writer': { color: 'bg-teal-50 border-teal-200', icon: '✍️', text: 'text-teal-700', system: 'You are a writer. Create engaging content based on research.' },
-                        'Critic': { color: 'bg-amber-50 border-amber-200', icon: '🧐', text: 'text-amber-700', system: 'You are a critic. Review and improve the content.' },
-                        'Coder': { color: 'bg-violet-50 border-violet-200', icon: '💻', text: 'text-violet-700', system: 'You are a coder. Generate high-quality code.' }
-                    }[type];
+                // Selection Logic
+                selectNode(id) {
+                    this.selectedNode = id;
+                    this.selectedEdge = null;
+                },
 
-                    this.nodes.push({ id, type, x: 100 + offset, y: 100 + offset, data: { system_prompt: def.system, ...def } });
+                selectEdge(source, target) {
+                    this.selectedEdge = { source, target };
+                    this.selectedNode = null;
+                    // Visual feedback could be added via jsPlumb api to highlight connection
+                },
 
-                    setTimeout(() => {
-                        const el = document.getElementById(id);
-                        this.instance.manage(el);
-                        this.instance.addEndpoint(el, { source: true, target: false, anchor: "Right" });
-                        this.instance.addEndpoint(el, { source: false, target: true, anchor: "Left" });
-                    }, 50);
+                clearSelection() {
+                    this.selectedNode = null;
+                    this.selectedEdge = null;
+                },
+
+                // Deletion Logic
+                promptDelete() {
+                    if (this.selectedNode) {
+                        this.itemToDelete = { type: 'node', id: this.selectedNode };
+                        this.showDeleteConfirm = true;
+                    } else if (this.selectedEdge) {
+                        // Edges delete immediately or prompt? User asked for "Click edge -> press Delete"
+                        // Optional: confirm for edges too? Let's just delete edges directly for speed, confirm for nodes.
+                        // Actually Plan said: "Show confirmation modal: 'Delete this node...'" for NODES.
+                        // For Edges: "Allow edge deletion (click edge -> press Delete)"
+                        this.deleteEdge(this.selectedEdge.source, this.selectedEdge.target);
+                        this.selectedEdge = null;
+                    }
+                },
+
+                confirmDelete() {
+                    if (this.itemToDelete) {
+                        if (this.itemToDelete.type === 'node') {
+                            this.removeNode(this.itemToDelete.id);
+                        }
+                        this.itemToDelete = null;
+                        this.showDeleteConfirm = false;
+                        this.clearSelection();
+                    }
                 },
 
                 removeNode(id) {
-                    this.instance.remove(document.getElementById(id));
+                    const node = this.nodes.find(n => n.id === id);
+                    if (!node) return;
+
+                    // Record before deleting
+                    const relatedEdges = this.edges.filter(e => e.source === id || e.target === id);
+                    this.record({ type: 'del-node', node: JSON.parse(JSON.stringify(node)), edges: relatedEdges });
+
+                    const el = document.getElementById(id);
+                    if (el) this.instance.remove(el);
+
                     this.nodes = this.nodes.filter(n => n.id !== id);
                     this.edges = this.edges.filter(e => e.source !== id && e.target !== id);
                 },
 
-                addEdge(source, target) {
-                    if (!this.edges.find(e => e.source === source && e.target === target)) this.edges.push({ source, target });
+                removeEdge(source, target) {
+                    // Record
+                    if (!this.isUndoRedo && this.edges.find(e => e.source === source && e.target === target)) {
+                        this.record({ type: 'del-edge', source, target });
+                    }
+
+                    this.edges = this.edges.filter(e => !(e.source === source && e.target === target));
+                    // Also Update jsPlumb if called programmatically, not via event
+                    const conns = this.instance.getConnections({ source: source, target: target });
+                    if (conns.length) this.instance.deleteConnection(conns[0]);
                 },
 
-                removeEdge(source, target) {
-                    this.edges = this.edges.filter(e => !(e.source === source && e.target === target));
+                addEdge(source, target, isProgrammatic = false) {
+                    if (!this.edges.find(e => e.source === source && e.target === target)) {
+                        this.edges.push({ source, target });
+                        if (!isProgrammatic) {
+                            // Link UI already there via jsPlumb, but we need to record it
+                            this.record({ type: 'add-edge', source, target });
+                        } else {
+                            // Restore visual connection if programmatic (undo/redo or load)
+                            const src = document.querySelector(`#${source} .output`);
+                            const tgt = document.querySelector(`#${target} .input`);
+                            if (src && tgt) {
+                                // Check if connection exists in jsPlumb already to avoid dupes visual
+                                const conns = this.instance.getConnections({ source: source, target: target });
+                                if (conns.length === 0) this.instance.connect({ source: src, target: tgt });
+                            }
+                        }
+                    }
+                },
+
+                // Editing Logic
+                openConfig(nodeId) {
+                    const node = this.nodes.find(n => n.id === nodeId);
+                    if (node) {
+                        this.editingNode = JSON.parse(JSON.stringify(node)); // Deep clone
+                        this.showConfigPanel = true;
+                    }
+                },
+
+                saveConfig() {
+                    const index = this.nodes.findIndex(n => n.id === this.editingNode.id);
+                    if (index !== -1) {
+                        // Update fields
+                        this.nodes[index].type = this.editingNode.type;
+                        this.nodes[index].data.system_prompt = this.editingNode.data.system_prompt;
+                        // Don't overwrite x/y/id
+                    }
+                    this.showConfigPanel = false;
+                    this.editingNode = null;
                 },
 
                 clearCanvas() {
                     this.instance.deleteEveryConnection();
-                    // Remove all managed elements
-                    this.nodes.forEach(n => this.instance.remove(document.getElementById(n.id)));
+                    this.nodes.forEach(n => {
+                        const el = document.getElementById(n.id);
+                        if (el) this.instance.remove(el);
+                    });
                     this.nodes = [];
                     this.edges = [];
                     this.logs = [];
                     this.reportContent = '';
+                    this.clearSelection();
                 },
 
                 saveWorkflow() {
-                    const data = {
-                        nodes: this.nodes,
-                        edges: this.edges,
-                        prompt: this.prompt
-                    };
-                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const data = this.getWorkflowData();
+                    const json = JSON.stringify(data, null, 2);
+                    const blob = new Blob([json], { type: 'application/json' });
                     const url = URL.createObjectURL(blob);
+
+                    const pad = (n) => n.toString().padStart(2, '0');
+                    const d = new Date();
+                    const timestamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+                    const filename = `agentforge_workflow_${timestamp}.json`;
+
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `workflow-${Date.now()}.json`;
+                    a.download = filename;
                     a.click();
+
+                    this.addToRecent(filename);
+                    this.notify("Workflow downloaded successfully!");
                 },
 
                 loadWorkflow() {
@@ -224,39 +749,26 @@
                     input.accept = 'application/json';
                     input.onchange = e => {
                         const file = e.target.files[0];
+                        if (!file) return;
+
                         const reader = new FileReader();
                         reader.onload = event => {
-                            const data = JSON.parse(event.target.result);
-                            this.clearCanvas();
-                            this.prompt = data.prompt || "";
-
-                            // Rehydrate nodes
-                            data.nodes.forEach((n, i) => {
-                                this.nodes.push(n);
-                                setTimeout(() => {
-                                    const el = document.getElementById(n.id);
-                                    if (el) {
-                                        this.instance.manage(el);
-                                        this.instance.addEndpoint(el, { source: true, target: false, anchor: "Right" });
-                                        this.instance.addEndpoint(el, { source: false, target: true, anchor: "Left" });
-                                    }
-                                }, 50);
-                            });
-
-                            // Rehydrate edges (delayed to ensure endpoints exist)
-                            setTimeout(() => {
-                                data.edges.forEach(e => {
-                                    this.instance.connect({ source: e.source, target: e.target });
-                                });
-                            }, 200 + (data.nodes.length * 20));
+                            try {
+                                const data = JSON.parse(event.target.result);
+                                this.loadData(data);
+                                this.addToRecent(file.name);
+                                this.notify("Workflow loaded successfully!");
+                            } catch (err) {
+                                this.notify("Failed to load workflow file.", "error");
+                            }
                         };
                         reader.readAsText(file);
                     };
                     input.click();
                 },
 
+                // ... keep clearLogs, addLog, downloadReport, runWorkflow as is ...
                 clearLogs() { this.logs = []; this.reportContent = ''; },
-
                 addLog(text, type = 'info', agent = 'System') {
                     if (type === 'info' && agent !== 'System') this.reportContent += text;
                     const lastLog = this.logs[this.logs.length - 1];
@@ -264,85 +776,284 @@
                     else this.logs.push({ message: text, type, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }), agent });
                     setTimeout(() => { const c = document.getElementById('logs-container'); if (c) c.scrollTop = c.scrollHeight; }, 10);
                 },
-
                 downloadReport() {
                     const blob = new Blob([this.reportContent], { type: 'text/markdown' });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url; a.download = `report-${Date.now()}.md`; a.click();
                 },
+                // Execution Controls
+                togglePause() {
+                    this.isPaused = !this.isPaused;
+                    if (!this.isPaused && this.activeNodeId) {
+                        // Resume logic if stuck? 
+                        // Actually the loop checks isPaused.
+                    }
+                },
+                stopWorkflow() {
+                    this.isRunning = false;
+                    this.activeNodeId = null;
+                    this.notify("Workflow stopped.", "error");
+                },
 
                 async runWorkflow() {
-                    if (this.nodes.length === 0) { this.addLog("No agents on canvas.", "error"); return; }
-                    this.isRunning = true; this.clearLogs(); this.addLog(`Starting...`, "info", "System");
+                    this.validateWorkflow();
+                    if (!this.validationStatus.valid) {
+                        this.notify("Cannot run: Workflow has errors.", "error");
+                        this.showValidationPanel = true;
+                        return;
+                    }
+                    if (this.nodes.length === 0) { this.notify("No agents on canvas.", "error"); return; }
+
+                    this.isRunning = true;
+                    this.isPaused = false;
+                    this.clearLogs();
+                    this.addLog(`Starting workflow...`, "info", "System");
+                    this.autoSave();
+
+                    // 1. Plan Execution Order (BFS/Topological sort for linear graphs)
+                    // For now, simple traversal: Start Node (no incoming) -> Children
+                    // This assumes a linear or tree structure for simplicity as per demo
+
+                    let queue = this.nodes.filter(n => this.edges.filter(e => e.target === n.id).length === 0); // Roots
+                    if (queue.length === 0) queue = [this.nodes[0]]; // Fallback
+
+                    // Reset Node Status
+                    this.nodes.forEach(n => { n.status = 'idle'; });
+
+                    this.executionQueue = [];
+                    // Build linear queue (bfs)
+                    const visited = new Set();
+                    const linearQueue = [];
+
+                    while (queue.length > 0) {
+                        const current = queue.shift();
+                        if (visited.has(current.id)) continue;
+                        visited.add(current.id);
+                        linearQueue.push(current);
+
+                        // Find children
+                        const childrenIds = this.edges.filter(e => e.source === current.id).map(e => e.target);
+                        const children = this.nodes.filter(n => childrenIds.includes(n.id));
+                        queue.push(...children);
+                    }
+
+                    this.totalSteps = linearQueue.length;
+                    this.currentStep = 0;
+                    this.executionHistory = [{ role: "user", content: this.prompt }];
+
+                    // 2. Execution Loop
+                    for (const node of linearQueue) {
+                        if (!this.isRunning) break;
+
+                        this.activeNodeId = node.id;
+                        this.currentStep++;
+                        node.status = 'running';
+
+                        // Pause Check
+                        while (this.isPaused && this.isRunning) {
+                            await new Promise(r => setTimeout(r, 500));
+                        }
+
+                        // Step Mode Check
+                        if (this.stepMode && this.currentStep > 1) { // Auto-run first step usually
+                            this.isPaused = true;
+                            this.notify(`Paused at ${node.type}. Press Play to continue.`);
+                            while (this.isPaused && this.isRunning) {
+                                await new Promise(r => setTimeout(r, 500));
+                            }
+                        }
+
+                        // Execute Node
+                        try {
+                            await this.executeNode(node);
+                            node.status = 'success';
+                        } catch (err) {
+                            node.status = 'error';
+                            this.notify(`Error at ${node.type}: ${err.message}`, 'error');
+                            // Determine if we stop or continue? Stop.
+                            this.isRunning = false;
+                            break;
+                        }
+                    }
+
+                    this.activeNodeId = null;
+                    if (this.isRunning) {
+                        this.notify("Workflow completed successfully!");
+                        this.isRunning = false;
+                    }
+                },
+
+                async executeNode(node) {
+                    const start = Date.now();
+                    this.addLog(`Executing ${node.type}...`, "info", "System");
+
                     try {
-                        const response = await fetch('http://localhost:8000/run', {
+                        const response = await fetch('http://localhost:8000/run_node', {
                             method: 'POST', headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
-                                workflow: {
-                                    nodes: this.nodes.map(n => ({ id: n.id, type: 'agent', data: n.data, position: { x: n.x, y: n.y } })),
-                                    edges: this.edges.map(e => ({ id: `${e.source}-${e.target}`, source: e.source, target: e.target }))
-                                }, prompt: this.prompt
+                                agent_config: { name: node.type, system_prompt: node.data.system_prompt },
+                                history: this.executionHistory,
+                                prompt: this.prompt // Initial prompt, history carries context
                             })
                         });
-                        const reader = response.body.getReader(); const decoder = new TextDecoder();
+
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        let finalContent = "";
+
                         while (true) {
-                            const { value, done } = await reader.read(); if (done) break;
-                            const chunks = decoder.decode(value).split('\n\n');
-                            chunks.forEach(chunk => {
-                                if (chunk.startsWith('data: ')) {
+                            if (!this.isRunning) { reader.cancel(); break; }
+
+                            const { value, done } = await reader.read();
+                            if (done) break;
+
+                            const chunk = decoder.decode(value);
+                            const lines = chunk.split('\n\n');
+
+                            for (const line of lines) {
+                                if (line.startsWith('data: ')) {
                                     try {
-                                        const event = JSON.parse(chunk.replace('data: ', ''));
-                                        const typeMap = { 'thought': 'info', 'error': 'error', 'success': 'success', 'info': 'info' };
-                                        this.addLog(event.text, typeMap[event.type] || 'info', event.agent);
+                                        const event = JSON.parse(line.replace('data: ', ''));
+                                        if (event.status === 'success') {
+                                            finalContent = event.content;
+                                        } else if (event.status === 'error') {
+                                            throw new Error("Backend Error");
+                                        } else if (event.type) {
+                                            // Real-time log
+                                            this.addLog(event.text, event.type === 'thought' ? 'info' : event.type, event.agent);
+                                        }
                                     } catch (e) { }
                                 }
-                            });
+                            }
                         }
-                    } catch (error) { this.addLog(`Error: ${error.message}`, "error", "System"); }
-                    finally { this.isRunning = false; this.addLog("Done.", "success", "System"); }
-                }
+
+                        // Append to history for next agent
+                        if (finalContent) {
+                            this.executionHistory.push({ role: "assistant", content: `[${node.type}]: ${finalContent}` });
+                            this.addLog(`Finished in ${((Date.now() - start) / 1000).toFixed(1)}s`, "success", "System");
+                        }
+
+                    } catch (error) {
+                        throw error;
+                    }
+                },
             });
         });
     </script>
 </head>
 
-<body class="bg-gray-50 h-screen flex flex-col overflow-hidden text-sm text-gray-700" x-data>
+<body
+    class="bg-gray-50 dark:bg-slate-900 h-screen flex flex-col overflow-hidden text-sm text-gray-700 dark:text-gray-200 transition-colors duration-300"
+    x-data @keydown.window.delete="$store.workflow.promptDelete()"
+    @keydown.window.backspace="$store.workflow.promptDelete()"
+    @keydown.escape.window="$store.workflow.clearSelection(); $store.workflow.showConfigPanel = false; $store.workflow.showDeleteConfirm = false; $store.workflow.showShortcuts = false;"
+    @keydown.space.window.prevent @keydown.window="
+        if (($event.ctrlKey || $event.metaKey) && $event.key === 's') { $event.preventDefault(); $store.workflow.saveWorkflow(); }
+        if (($event.ctrlKey || $event.metaKey) && $event.key === 'z') { $event.preventDefault(); $store.workflow.undo(); }
+        if (($event.ctrlKey || $event.metaKey) && $event.key === 'y') { $event.preventDefault(); $store.workflow.redo(); }
+        if (($event.ctrlKey || $event.metaKey) && $event.key === 'a') { $event.preventDefault(); /* Select all? logic needed */ }
+        if ($event.key === '?') { $store.workflow.showShortcuts = true; }
+    ">
 
     <!-- Header -->
     <header
-        class="h-14 bg-white border-b border-gray-200 flex items-center justify-between px-6 z-20 shadow-sm shrink-0">
-        <div class="flex items-center gap-3">
-            <div
-                class="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold shadow-indigo-200 shadow-md">
+        class="bg-white dark:bg-slate-800 border-b border-gray-200 dark:border-slate-700 h-16 flex items-center justify-between px-6 z-30 shadow-sm transition-colors duration-300">
+        <div class="flex items-center gap-4">
+            <div class="bg-indigo-600 p-2 rounded-lg shadow-lg shadow-indigo-500/30">
                 <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                    class="text-white">
+                    <path d="M12 2a10 10 0 1 0 10 10 4 4 0 0 1-5-5 4 4 0 0 1-5-5c0-5.523 4.477-10 10-10z"></path>
                 </svg>
             </div>
-            <span class="text-lg font-bold text-gray-800 tracking-tight">AgentForge</span>
+            <div>
+                <h1 class="font-bold text-xl tracking-tight text-gray-900 dark:text-white">AgentForge</h1>
+                <p class="text-[10px] text-gray-500 dark:text-gray-400 font-medium tracking-wider uppercase">Visual
+                    Workflow
+                    Builder</p>
+            </div>
         </div>
-        <div class="flex items-center gap-3">
-            <button @click="$store.workflow.saveWorkflow()"
-                class="text-gray-500 hover:text-indigo-600 px-3 py-1.5 rounded-md hover:bg-indigo-50 transition-colors text-xs font-medium flex items-center gap-1">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
-                    <polyline points="17 21 17 13 7 13 7 21"></polyline>
-                    <polyline points="7 3 7 8 15 8"></polyline>
+
+        <div class="flex items-center gap-4">
+            <!-- Theme Toggle -->
+            <button @click="$store.workflow.toggleTheme()"
+                class="p-2 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-slate-700 transition-colors"
+                title="Toggle Theme">
+                <svg x-show="$store.workflow.theme === 'light'" xmlns="http://www.w3.org/2000/svg" width="20"
+                    height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
                 </svg>
-                Save
-            </button>
-            <button @click="$store.workflow.loadWorkflow()"
-                class="text-gray-500 hover:text-indigo-600 px-3 py-1.5 rounded-md hover:bg-indigo-50 transition-colors text-xs font-medium flex items-center gap-1">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                    <polyline points="17 8 12 3 7 8"></polyline>
-                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                <svg x-show="$store.workflow.theme === 'dark'" xmlns="http://www.w3.org/2000/svg" width="20" height="20"
+                    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                    stroke-linejoin="round" class="text-amber-400">
+                    <circle cx="12" cy="12" r="5"></circle>
+                    <line x1="12" y1="1" x2="12" y2="3"></line>
+                    <line x1="12" y1="21" x2="12" y2="23"></line>
+                    <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+                    <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+                    <line x1="1" y1="12" x2="3" y2="12"></line>
+                    <line x1="21" y1="12" x2="23" y2="12"></line>
+                    <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+                    <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
                 </svg>
-                Load
             </button>
+
+            <!-- File Controls -->
+            <!-- Recent Dropdown (Simplistic) -->
+            <div x-show="$store.workflow.recentWorkflows.length > 0" class="relative" x-data="{ open: false }">
+                <button @click="open = !open" class="text-xs text-gray-400 flex items-center gap-1 hover:text-gray-600">
+                    Recent <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"
+                        fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="6 9 12 15 18 9"></polyline>
+                    </svg>
+                </button>
+                <div x-show="open" @click.outside="open = false"
+                    class="absolute top-full left-0 mt-1 w-48 bg-white border border-gray-100 shadow-lg rounded-lg py-1 z-30"
+                    style="display: none;">
+                    <template x-for="recent in $store.workflow.recentWorkflows">
+                        <div class="px-3 py-2 hover:bg-gray-50 text-xs text-gray-600 cursor-pointer truncate"
+                            x-text="recent.name"></div>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+        <div class="flex items-center gap-4">
+            <!-- Validation Badge -->
+            <button @click="$store.workflow.showValidationPanel = !$store.workflow.showValidationPanel"
+                class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold transition-all"
+                :class="$store.workflow.validationStatus.valid ? 'bg-green-100 text-green-700 hover:bg-green-200' : 'bg-amber-100 text-amber-700 hover:bg-amber-200 ring-2 ring-amber-300'">
+                <span x-text="$store.workflow.validationStatus.valid ? '✓ Valid' : '⚠ Issues'"></span>
+                <span x-show="!$store.workflow.validationStatus.valid"
+                    class="bg-amber-600 text-white rounded-full px-1.5 w-4 h-4 flex items-center justify-center text-[10px]"
+                    x-text="$store.workflow.validationStatus.issues.length"></span>
+            </button>
+
+            <!-- Save/Load -->
+            <div class="flex items-center gap-2">
+                <button @click="$store.workflow.saveWorkflow()"
+                    class="text-gray-500 hover:text-indigo-600 px-3 py-1.5 rounded-md hover:bg-indigo-50 transition-colors text-xs font-medium flex items-center gap-1">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                        <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                        <polyline points="7 3 7 8 15 8"></polyline>
+                    </svg>
+                    Save
+                </button>
+                <button @click="$store.workflow.loadWorkflow()"
+                    class="text-gray-500 hover:text-indigo-600 px-3 py-1.5 rounded-md hover:bg-indigo-50 transition-colors text-xs font-medium flex items-center gap-1">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                    Load
+                </button>
+            </div>
             <div class="h-4 w-px bg-gray-300 mx-1"></div>
             <a href="https://github.com/agentforge/agentforge" target="_blank"
                 class="text-gray-400 hover:text-gray-900 transition-colors">
@@ -352,68 +1063,203 @@
                         d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" />
                 </svg>
             </a>
+            <button @click="$store.workflow.showShortcuts = true"
+                class="text-gray-400 hover:text-indigo-600 font-bold ml-2">?</button>
         </div>
     </header>
 
     <div class="flex-1 flex overflow-hidden">
-        <aside class="w-64 bg-white border-r border-gray-200 flex flex-col z-10 shrink-0">
-            <div class="p-4 border-b border-gray-100">
-                <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Components</h2>
-            </div>
-            <div class="p-4 space-y-3">
-                <template x-for="agent in ['Researcher', 'Writer', 'Critic', 'Coder']">
-                    <button @click="$store.workflow.addNode(agent)"
-                        class="w-full text-left bg-indigo-600 text-white rounded-lg p-3 hover:bg-indigo-700 hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 flex items-center gap-3 group">
-                        <span class="text-xl group-hover:scale-110 transition-transform"
-                            x-text="{ 'Researcher': '🔍', 'Writer': '✍️', 'Critic': '🧐', 'Coder': '💻' }[agent]"></span>
-                        <div class="flex-1">
-                            <div class="font-semibold" x-text="agent"></div>
-                            <div class="text-xs text-indigo-200 opacity-80 font-light">Add Agent</div>
+        <!-- Sidebar -->
+        <aside
+            class="w-72 bg-white dark:bg-slate-800 border-r border-gray-200 dark:border-slate-700 flex flex-col z-20 shadow-[4px_0_24px_-12px_rgba(0,0,0,0.1)] transition-colors duration-300">
+            <div class="p-6 border-b border-gray-100 dark:border-slate-700">
+                <h2 class="text-xs font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-4">Agent
+                    Library</h2>
+                <div class="grid grid-cols-2 gap-3">
+                    <div draggable="true"
+                        @dragstart="$event.dataTransfer.setData('type', 'Researcher'); $event.dataTransfer.effectAllowed = 'copy';"
+                        class="p-3 bg-indigo-50 dark:bg-slate-700/50 border border-indigo-100 dark:border-slate-600 rounded-xl cursor-grab hover:shadow-md hover:border-indigo-300 dark:hover:border-indigo-500 transition-all group">
+                        <div
+                            class="text-indigo-600 dark:text-indigo-400 mb-2 group-hover:scale-110 transition-transform">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+                                fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                stroke-linejoin="round">
+                                <circle cx="11" cy="11" r="8"></circle>
+                                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                            </svg>
                         </div>
-                    </button>
-                </template>
+                        <span class="font-semibold text-indigo-900 dark:text-indigo-100 text-xs block">Researcher</span>
+                    </div>
+                    <div draggable="true"
+                        @dragstart="$event.dataTransfer.setData('type', 'Writer'); $event.dataTransfer.effectAllowed = 'copy';"
+                        class="p-3 bg-teal-50 dark:bg-slate-700/50 border border-teal-100 dark:border-slate-600 rounded-xl cursor-grab hover:shadow-md hover:border-teal-300 dark:hover:border-teal-500 transition-all group">
+                        <div class="text-teal-600 dark:text-teal-400 mb-2 group-hover:scale-110 transition-transform">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+                                fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                stroke-linejoin="round">
+                                <path d="M12 20h9"></path>
+                                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+                            </svg>
+                        </div>
+                        <span class="font-semibold text-teal-900 dark:text-teal-100 text-xs block">Writer</span>
+                    </div>
+                    <div draggable="true"
+                        @dragstart="$event.dataTransfer.setData('type', 'Critic'); $event.dataTransfer.effectAllowed = 'copy';"
+                        class="p-3 bg-amber-50 dark:bg-slate-700/50 border border-amber-100 dark:border-slate-600 rounded-xl cursor-grab hover:shadow-md hover:border-amber-300 dark:hover:border-amber-500 transition-all group">
+                        <div class="text-amber-600 dark:text-amber-400 mb-2 group-hover:scale-110 transition-transform">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+                                fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                stroke-linejoin="round">
+                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                                <line x1="9" y1="9" x2="15" y2="15"></line>
+                                <line x1="15" y1="9" x2="9" y2="15"></line>
+                            </svg>
+                        </div>
+                        <span class="font-semibold text-amber-900 dark:text-amber-100 text-xs block">Critic</span>
+                    </div>
+                    <div draggable="true"
+                        @dragstart="$event.dataTransfer.setData('type', 'Coder'); $event.dataTransfer.effectAllowed = 'copy';"
+                        class="p-3 bg-violet-50 dark:bg-slate-700/50 border border-violet-100 dark:border-slate-600 rounded-xl cursor-grab hover:shadow-md hover:border-violet-300 dark:hover:border-violet-500 transition-all group">
+                        <div
+                            class="text-violet-600 dark:text-violet-400 mb-2 group-hover:scale-110 transition-transform">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+                                fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                stroke-linejoin="round">
+                                <polyline points="16 18 22 12 16 6"></polyline>
+                                <polyline points="8 6 2 12 8 18"></polyline>
+                            </svg>
+                        </div>
+                        <span class="font-semibold text-violet-900 dark:text-violet-100 text-xs block">Coder</span>
+                    </div>
+                </div>
             </div>
         </aside>
 
         <main class="flex-1 relative overflow-hidden bg-gray-50 flex flex-col">
-            <div id="canvas" class="flex-1 relative bg-grid cursor-crosshair" @dblclick.self="">
-                <div class="absolute inset-0 flex items-center justify-center pointer-events-none"
-                    x-show="$store.workflow.nodes.length === 0">
-                    <div class="text-center opacity-40">
-                        <svg class="w-16 h-16 mx-auto text-gray-400 mb-2" xmlns="http://www.w3.org/2000/svg"
-                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
-                            <rect x="2" y="10" width="20" height="8" rx="2" ry="2" />
-                            <path d="M12 2v20" />
+            <div id="canvas" class="flex-1 relative overflow-hidden cursor-crosshair active:cursor-grabbing"
+                @mousedown="$store.workflow.startPan($event)" @mousemove="$store.workflow.doPan($event)"
+                @mouseup="$store.workflow.endPan()" @mouseleave="$store.workflow.endPan()"
+                @wheel="$store.workflow.handleWheel($event)" @dblclick.self="$store.workflow.clearSelection()"
+                @click.self="$store.workflow.clearSelection()">
+
+                <!-- Transform Layer -->
+                <div id="canvas-layer" class="bg-grid"
+                    :style="`transform: translate(${$store.workflow.pan.x}px, ${$store.workflow.pan.y}px) scale(${$store.workflow.zoom})`">
+
+                    <div class="absolute inset-0 flex items-center justify-center pointer-events-none"
+                        x-show="$store.workflow.nodes.length === 0" style="width: 2000px; height: 1000px;">
+                        <!-- Placeholder size -->
+                        <div class="text-center opacity-40">
+                            <svg class="w-16 h-16 mx-auto text-gray-400 mb-2" xmlns="http://www.w3.org/2000/svg"
+                                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+                                <rect x="2" y="10" width="20" height="8" rx="2" ry="2" />
+                                <path d="M12 2v20" />
+                            </svg>
+                            <p class="text-gray-500 font-medium">Drag agents to build (or load demo)</p>
+                        </div>
+                    </div>
+                    <template x-for="node in $store.workflow.nodes" :key="node.id">
+                        <div :id="node.id"
+                            class="absolute w-72 rounded-xl border shadow-sm hover:shadow-xl transition-all duration-200 flex flex-col z-20 group bg-white"
+                            :class="[{'ring-2 ring-indigo-500 shadow-md': $store.workflow.selectedNode === node.id}, node.data.color]"
+                            :style="`left: ${node.x}px; top: ${node.y}px;`"
+                            @click.stop="$store.workflow.selectNode(node.id)"
+                            @dblclick.stop="$store.workflow.openConfig(node.id)">
+
+                            <!-- Ports -->
+                            <div class="port input"></div>
+                            <div class="port output"></div>
+
+                            <!-- Status Indicator -->
+                            <div class="absolute -top-1 -right-1 w-3 h-3 rounded-full border-2 border-white z-50 shadow-sm"
+                                :class="{
+                                     'bg-gray-300': !node.status || node.status === 'idle',
+                                     'bg-indigo-500 animate-pulse': node.status === 'running',
+                                     'bg-green-500': node.status === 'success',
+                                     'bg-red-500': node.status === 'error'
+                                 }"></div>
+
+                            <div class="p-3 border-b flex justify-between items-center bg-opacity-50 cursor-grab active:cursor-grabbing rounded-t-xl transition-all duration-300"
+                                :class="[
+                                node.data.text.replace('text-', 'bg-').replace('700', '100'), 
+                                $store.workflow.validationStatus.issues.find(i => i.id === node.id) ? 'border-amber-300' : '',
+                                $store.workflow.activeNodeId === node.id ? 'ring-2 ring-indigo-500 ring-offset-2' : ''
+                            ]">
+                                <div class="flex items-center gap-2">
+                                    <span class="text-lg" x-text="node.data.icon"></span>
+                                    <span
+                                        class="font-bold tracking-tight cursor-text focus:outline-none focus:border-b focus:border-indigo-500"
+                                        :class="node.data.text" x-text="node.type" contenteditable="true"
+                                        @blur="node.type = $event.target.innerText"></span>
+                                </div>
+                                <!-- Action Buttons -->
+                                <div
+                                    class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <button @click.stop="$store.workflow.openConfig(node.id)"
+                                        class="text-gray-400 hover:text-indigo-600 p-1 rounded hover:bg-white/50"
+                                        title="Settings">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
+                                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                            stroke-linecap="round" stroke-linejoin="round">
+                                            <circle cx="12" cy="12" r="3"></circle>
+                                            <path
+                                                d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+                                            </path>
+                                        </svg>
+                                    </button>
+                                    <button
+                                        @click.stop="$store.workflow.selectNode(node.id); $store.workflow.promptDelete()"
+                                        class="text-gray-400 hover:text-red-500 p-1 rounded hover:bg-white/50"
+                                        title="Delete">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
+                                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                            stroke-linecap="round" stroke-linejoin="round">
+                                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="p-4 bg-white rounded-b-xl">
+                                <label class="block text-xs font-semibold text-gray-500 uppercase mb-2">System
+                                    Prompt</label>
+                                <textarea x-model="node.data.system_prompt" rows="3"
+                                    class="w-full text-xs text-gray-600 border border-gray-200 rounded-md p-2 focus:ring-2 focus:ring-indigo-500 outline-none resize-none bg-gray-50"
+                                    @keydown.stop></textarea>
+                            </div>
+                        </div>
+                    </template>
+                </div> <!-- End Transform Layer -->
+            </div>
+
+            <!-- Zoom Controls -->
+            <div class="absolute bottom-6 left-6 z-50 flex flex-col gap-2">
+                <div
+                    class="bg-white/90 backdrop-blur rounded-xl shadow-lg border border-gray-200 p-1 flex flex-col gap-1">
+                    <button @click="$store.workflow.setZoom($store.workflow.zoom + 0.1)"
+                        class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Zoom In">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2">
+                            <line x1="12" y1="5" x2="12" y2="19"></line>
+                            <line x1="5" y1="12" x2="19" y2="12"></line>
                         </svg>
-                        <p class="text-gray-500 font-medium">Drag agents to build (or load demo)</p>
-                    </div>
+                    </button>
+                    <button @click="$store.workflow.centerCanvas()"
+                        class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Fit to Screen">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                    </button>
+                    <button @click="$store.workflow.setZoom($store.workflow.zoom - 0.1)"
+                        class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Zoom Out">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2">
+                            <line x1="5" y1="12" x2="19" y2="12"></line>
+                        </svg>
+                    </button>
                 </div>
-                <template x-for="node in $store.workflow.nodes" :key="node.id">
-                    <div :id="node.id"
-                        class="absolute w-72 rounded-xl border shadow-sm hover:shadow-xl transition-all duration-200 flex flex-col z-20 group bg-white"
-                        :class="node.data.color" :style="`left: ${node.x}px; top: ${node.y}px;`">
-                        <div class="p-3 border-b flex justify-between items-center bg-opacity-50 cursor-grab active:cursor-grabbing rounded-t-xl"
-                            :class="node.data.text.replace('text-', 'bg-').replace('700', '100')">
-                            <div class="flex items-center gap-2"><span class="text-lg"
-                                    x-text="node.data.icon"></span><span class="font-bold tracking-tight"
-                                    :class="node.data.text" x-text="node.type"></span></div>
-                            <button @click="$store.workflow.removeNode(node.id)"
-                                class="text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"><svg
-                                    xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
-                                    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                    stroke-linejoin="round">
-                                    <line x1="18" y1="6" x2="6" y2="18"></line>
-                                    <line x1="6" y1="6" x2="18" y2="18"></line>
-                                </svg></button>
-                        </div>
-                        <div class="p-4 bg-white rounded-b-xl">
-                            <label class="block text-xs font-semibold text-gray-500 uppercase mb-2">System
-                                Prompt</label>
-                            <textarea x-model="node.data.system_prompt" rows="3"
-                                class="w-full text-xs text-gray-600 border border-gray-200 rounded-md p-2 focus:ring-2 focus:ring-indigo-500 outline-none resize-none bg-gray-50"></textarea>
-                        </div>
-                    </div>
-                </template>
             </div>
 
             <div class="absolute bottom-6 left-1/2 transform -translate-x-1/2 w-full max-w-2xl px-4 z-50">
@@ -434,14 +1280,13 @@
                             </svg></button>
                     </div>
                     <button @click="$store.workflow.runWorkflow()" :disabled="$store.workflow.isRunning"
-                        class="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl font-semibold text-sm transition-all shadow-lg hover:shadow-indigo-300 disabled:opacity-50 flex items-center gap-2">
-                        <span x-show="!$store.workflow.isRunning">Run</span><span
-                            x-show="$store.workflow.isRunning">Running</span>
+                        class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium shadow-sm transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
                         <svg x-show="!$store.workflow.isRunning" xmlns="http://www.w3.org/2000/svg" width="16"
-                            height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                            stroke-linecap="round" stroke-linejoin="round">
                             <polygon points="5 3 19 12 5 21 5 3"></polygon>
                         </svg>
-                        <svg x-show="$store.workflow.isRunning" class="animate-spin h-4 w-4"
+                        <svg x-show="$store.workflow.isRunning" class="animate-spin -ml-1 mr-2 h-4 w-4 text-white"
                             xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4">
                             </circle>
@@ -449,7 +1294,15 @@
                                 d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
                             </path>
                         </svg>
+                        <span x-text="$store.workflow.isRunning ? 'Running...' : 'Run Workflow'"></span>
                     </button>
+
+                    <div class="flex items-center gap-2 ml-4">
+                        <input type="checkbox" id="stepMode" x-model="$store.workflow.stepMode"
+                            class="text-indigo-600 rounded focus:ring-indigo-500">
+                        <label for="stepMode" class="text-xs text-gray-600 font-medium cursor-pointer select-none">Step
+                            Mode</label>
+                    </div>
                 </div>
             </div>
         </main>
@@ -471,7 +1324,8 @@
                         <div class="mt-1 flex-shrink-0">
                             <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shadow-sm ring-2 ring-white"
                                 :class="{'bg-indigo-500': log.agent.includes('Researcher'), 'bg-teal-500': log.agent.includes('Writer'), 'bg-amber-500': log.agent.includes('Critic'), 'bg-violet-500': log.agent.includes('Coder'), 'bg-gray-400': !['Researcher', 'Writer', 'Critic', 'Coder'].some(r => log.agent.includes(r))}">
-                                <span x-text="log.agent[0]"></span></div>
+                                <span x-text="log.agent[0]"></span>
+                            </div>
                         </div>
                         <div class="flex-1 relative group">
                             <div class="flex items-baseline justify-between mb-1 pl-1"><span
@@ -492,7 +1346,8 @@
                                 fill="none" stroke="currentColor" stroke-width="2" class="text-gray-400">
                                 <circle cx="12" cy="12" r="10"></circle>
                                 <polyline points="12 6 12 12 16 14"></polyline>
-                            </svg></div>
+                            </svg>
+                        </div>
                     </div>
                     <div
                         class="bg-white p-3 rounded-2xl rounded-tl-none border border-gray-100 shadow-sm flex items-center gap-1 w-16">
@@ -504,6 +1359,294 @@
             </div>
         </aside>
     </div>
+    <!-- Config Panel -->
+    <div x-show="$store.workflow.showConfigPanel" class="fixed inset-0 z-50 overflow-hidden" style="display: none;">
+        <div class="absolute inset-0 bg-gray-900/50 backdrop-blur-sm transition-opacity"
+            @click="$store.workflow.saveConfig()"></div>
+        <div class="absolute inset-y-0 right-0 w-96 bg-white shadow-2xl transform transition-transform border-l border-gray-200 flex flex-col animate-fade-in-up"
+            style="animation-name: slideInRight; animation-duration: 0.3s;">
+            <div class="p-6 border-b border-gray-100 flex justify-between items-center">
+                <h2 class="text-lg font-bold text-gray-800">Agent Configuration</h2>
+                <button @click="$store.workflow.saveConfig()" class="text-gray-400 hover:text-gray-600">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+            <div class="flex-1 overflow-y-auto p-6 space-y-6" x-if="$store.workflow.editingNode">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Agent Role</label>
+                    <input type="text" x-model="$store.workflow.editingNode.type"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">System Prompt</label>
+                    <textarea x-model="$store.workflow.editingNode.data.system_prompt" rows="10"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all resize-none text-sm font-mono bg-gray-50"></textarea>
+                    <p class="mt-2 text-xs text-gray-500">Define the agent's personality, goals, and constraints.</p>
+                </div>
+            </div>
+            <div class="p-6 border-t border-gray-100 bg-gray-50 flex gap-3">
+                <button @click="$store.workflow.saveConfig()"
+                    class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-medium shadow-sm transition-all">Save
+                    Changes</button>
+                <button @click="$store.workflow.showConfigPanel = false"
+                    class="flex-1 bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 px-4 py-2 rounded-lg font-medium transition-all">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Shortcuts Modal -->
+    <div x-show="$store.workflow.showShortcuts"
+        class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+        style="display: none;">
+
+        <div class="fixed inset-0 transition-opacity" @click="$store.workflow.showShortcuts = false"></div>
+
+        <div class="bg-white rounded-2xl shadow-2xl max-w-sm w-full overflow-hidden animate-fade-in-up z-10 relative">
+            <div class="p-5 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+                <h2 class="text-sm font-bold text-gray-800 uppercase tracking-wide">Keyboard Shortcuts</h2>
+                <button @click="$store.workflow.showShortcuts = false" class="text-gray-400 hover:text-gray-600">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+            <div class="p-2">
+                <div
+                    class="flex justify-between items-center p-3 border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                    <span class="text-xs font-medium text-gray-600">Save Workflow</span>
+                    <kbd
+                        class="bg-white px-2 py-1 rounded text-[10px] font-bold text-gray-500 border border-gray-200 shadow-sm flex items-center gap-1">Ctrl
+                        + S</kbd>
+                </div>
+                <div
+                    class="flex justify-between items-center p-3 border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                    <span class="text-xs font-medium text-gray-600">Undo Action</span>
+                    <kbd
+                        class="bg-white px-2 py-1 rounded text-[10px] font-bold text-gray-500 border border-gray-200 shadow-sm flex items-center gap-1">Ctrl
+                        + Z</kbd>
+                </div>
+                <div
+                    class="flex justify-between items-center p-3 border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                    <span class="text-xs font-medium text-gray-600">Redo Action</span>
+                    <kbd
+                        class="bg-white px-2 py-1 rounded text-[10px] font-bold text-gray-500 border border-gray-200 shadow-sm flex items-center gap-1">Ctrl
+                        + Y</kbd>
+                </div>
+                <div
+                    class="flex justify-between items-center p-3 border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                    <span class="text-xs font-medium text-gray-600">Delete Selected</span>
+                    <kbd
+                        class="bg-white px-2 py-1 rounded text-[10px] font-bold text-gray-500 border border-gray-200 shadow-sm flex items-center gap-1">Del</kbd>
+                </div>
+                <div
+                    class="flex justify-between items-center p-3 border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                    <span class="text-xs font-medium text-gray-600">Pan Canvas</span>
+                    <kbd
+                        class="bg-white px-2 py-1 rounded text-[10px] font-bold text-gray-500 border border-gray-200 shadow-sm flex items-center gap-1">Space
+                        + Drag</kbd>
+                </div>
+                <div class="flex justify-between items-center p-3 hover:bg-gray-50 transition-colors">
+                    <span class="text-xs font-medium text-gray-600">Show Shortcuts</span>
+                    <kbd
+                        class="bg-white px-2 py-1 rounded text-[10px] font-bold text-gray-500 border border-gray-200 shadow-sm flex items-center gap-1">?</kbd>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Confirmation Modal -->
+    <div x-show="$store.workflow.showDeleteConfirm"
+        class="fixed inset-0 z-50 flex items-center justify-center p-4 px-4 pb-20 text-center sm:block sm:p-0"
+        style="display: none;">
+        <div class="fixed inset-0 transition-opacity bg-gray-500 bg-opacity-75" aria-hidden="true"
+            @click="$store.workflow.showDeleteConfirm = false"></div>
+        <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
+        <div
+            class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full animate-fade-in-up">
+            <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+                <div class="sm:flex sm:items-start">
+                    <div
+                        class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-red-100 sm:mx-0 sm:h-10 sm:w-10">
+                        <svg class="h-6 w-6 text-red-600" xmlns="http://www.w3.org/2000/svg" fill="none"
+                            viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                        </svg>
+                    </div>
+                    <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
+                        <h3 class="text-lg leading-6 font-medium text-gray-900" id="modal-title">
+                            Delete Agent?
+                        </h3>
+                        <div class="mt-2">
+                            <p class="text-sm text-gray-500">
+                                Are you sure you want to delete this agent? All connections to this agent will also be
+                                removed. This action cannot be undone.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+                <button type="button" @click="$store.workflow.confirmDelete()"
+                    class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-red-600 text-base font-medium text-white hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 sm:ml-3 sm:w-auto sm:text-sm">
+                    Delete
+                </button>
+                <button type="button" @click="$store.workflow.showDeleteConfirm = false"
+                    class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-4 py-2 bg-white text-base font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm">
+                    Cancel
+                </button>
+            </div>
+        </div>
+    </div>
+
+    </div>
+    </div>
+
+    <!-- Issues Panel -->
+    <div x-show="$store.workflow.showValidationPanel"
+        class="absolute top-16 right-6 w-80 bg-white shadow-xl rounded-xl border border-gray-200 z-40 animate-fade-in-up"
+        @click.outside="$store.workflow.showValidationPanel = false" style="display: none;">
+        <div class="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50 rounded-t-xl">
+            <h3 class="font-bold text-gray-700">Workflow Issues</h3>
+            <button @click="$store.workflow.showValidationPanel = false"
+                class="text-gray-400 hover:text-gray-600">×</button>
+        </div>
+        <div class="max-h-96 overflow-y-auto p-2">
+            <template x-if="$store.workflow.validationStatus.issues.length === 0">
+                <div class="text-center p-6 text-gray-400 flex flex-col items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" class="mb-2 text-green-500">
+                        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                        <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                    </svg>
+                    <p>All looks good!</p>
+                </div>
+            </template>
+            <template x-for="issue in $store.workflow.validationStatus.issues" :key="issue.id + issue.message">
+                <div class="p-3 mb-2 rounded-lg border flex gap-3 cursor-pointer hover:bg-gray-50 transition-colors"
+                    :class="issue.level === 'error' ? 'bg-red-50 border-red-100' : 'bg-amber-50 border-amber-100'"
+                    @click="$store.workflow.selectNode(issue.id); $store.workflow.showValidationPanel = false">
+                    <div class="mt-0.5">
+                        <svg x-show="issue.level === 'error'" class="text-red-500 w-4 h-4"
+                            xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <svg x-show="issue.level === 'warning'" class="text-amber-500 w-4 h-4"
+                            xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                        </svg>
+                    </div>
+                    <div>
+                        <p class="text-xs font-semibold"
+                            :class="issue.level === 'error' ? 'text-red-800' : 'text-amber-800'" x-text="issue.message">
+                        </p>
+                        <p class="text-[10px] text-gray-500 mt-0.5">Click to locate node</p>
+                    </div>
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="fixed bottom-6 right-6 z-50 flex flex-col gap-2 pointer-events-none">
+        <template x-for="toast in $store.workflow.notifications" :key="toast.id">
+            <div class="bg-indigo-900/90 text-white px-4 py-3 rounded-lg shadow-xl backdrop-blur-md flex items-center gap-3 text-sm font-medium animate-fade-in-up"
+                x-transition:enter="toast-enter" x-transition:enter-start="toast-enter"
+                x-transition:enter-end="toast-enter-active" x-transition:leave="toast-leave"
+                x-transition:leave-start="toast-leave" x-transition:leave-end="toast-leave-active">
+                <svg x-show="toast.type === 'success'" class="text-green-400 w-5 h-5" xmlns="http://www.w3.org/2000/svg"
+                    fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                </svg>
+                <svg x-show="toast.type === 'error'" class="text-red-400 w-5 h-5" xmlns="http://www.w3.org/2000/svg"
+                    fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span x-text="toast.message"></span>
+            </div>
+        </template>
+    </div>
+
+    <!-- Welcome Modal -->
+    <div x-show="$store.workflow.showWelcome"
+        class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50 backdrop-blur-md"
+        style="display: none;">
+        <div
+            class="bg-white dark:bg-slate-800 rounded-3xl shadow-2xl max-w-2xl w-full overflow-hidden animate-fade-in-up flex flex-col md:flex-row">
+            <div class="bg-indigo-600 p-8 md:w-2/5 flex flex-col justify-between text-white relative overflow-hidden">
+                <div
+                    class="absolute inset-0 opacity-20 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')]">
+                </div>
+                <div class="relative z-10">
+                    <h2 class="text-3xl font-bold mb-2">Welcome to AgentForge</h2>
+                    <p class="text-indigo-100 text-sm">Build powerful multi-agent AI systems visually.</p>
+                </div>
+                <div class="relative z-10 mt-8">
+                    <div class="flex items-center gap-2 text-sm font-medium opacity-80 mb-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="20 6 9 17 4 12"></polyline>
+                        </svg> Drag & Drop Agents
+                    </div>
+                    <div class="flex items-center gap-2 text-sm font-medium opacity-80 mb-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="20 6 9 17 4 12"></polyline>
+                        </svg> Connect Logic
+                    </div>
+                    <div class="flex items-center gap-2 text-sm font-medium opacity-80">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="20 6 9 17 4 12"></polyline>
+                        </svg> Watch Execution
+                    </div>
+                </div>
+            </div>
+            <div class="p-8 md:w-3/5 flex flex-col justify-center">
+                <h3 class="text-xl font-bold text-gray-800 dark:text-white mb-4">Get Started</h3>
+                <div class="space-y-4">
+                    <button @click="$store.workflow.loadDemo(); $store.workflow.finishOnboarding()"
+                        class="w-full text-left p-4 rounded-xl border border-gray-200 dark:border-slate-700 hover:border-indigo-500 hover:bg-indigo-50 dark:hover:bg-slate-700 transition-all group">
+                        <span
+                            class="block font-bold text-gray-900 dark:text-white group-hover:text-indigo-700 dark:group-hover:text-indigo-300 mb-1">Load
+                            Demo Workflow</span>
+                        <span class="block text-xs text-gray-500 dark:text-gray-400">Analysis of 2026 EV Market
+                            (Researcher -> Writer -> Critic)</span>
+                    </button>
+                    <button @click="$store.workflow.finishOnboarding()"
+                        class="w-full text-left p-4 rounded-xl border border-gray-200 dark:border-slate-700 hover:border-gray-400 hover:bg-gray-50 dark:hover:bg-slate-700 transition-all group">
+                        <span class="block font-bold text-gray-900 dark:text-white mb-1">Start from Scratch</span>
+                        <span class="block text-xs text-gray-500 dark:text-gray-400">Empty canvas. You are the
+                            architect.</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Animation Keyframes -->
+    <style>
+        @keyframes slideInRight {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+    </style>
 </body>
 
 </html>
