@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgentForge - Visual Agent Workflow Builder</title>
+    <meta name="description" content="Build and execute multi-agent AI workflows visually.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.3/dist/cdn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@jsplumb/browser-ui@5.13.4/js/jsplumb.browser-ui.umd.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        .jtk-connector path {
+            stroke: #6366f1;
+            stroke-width: 2;
+        }
+
+        .jtk-endpoint {
+            z-index: 10;
+        }
+
+        .jtk-overlay {
+            z-index: 10;
+        }
+
+        .bg-grid {
+            background-size: 20px 20px;
+            background-image:
+                linear-gradient(to right, rgba(99, 102, 241, 0.05) 1px, transparent 1px),
+                linear-gradient(to bottom, rgba(99, 102, 241, 0.05) 1px, transparent 1px);
+        }
+
+        .typing-dot {
+            animation: typing 1.4s infinite ease-in-out both;
+        }
+
+        .typing-dot:nth-child(1) {
+            animation-delay: -0.32s;
+        }
+
+        .typing-dot:nth-child(2) {
+            animation-delay: -0.16s;
+        }
+
+        @keyframes typing {
+
+            0%,
+            80%,
+            100% {
+                transform: scale(0);
+            }
+
+            40% {
+                transform: scale(1);
+            }
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .animate-fade-in-up {
+            animation: fadeInUp 0.3s ease-out forwards;
+        }
+    </style>
+    <script>
+        document.addEventListener('alpine:init', () => {
+            Alpine.store('workflow', {
+                nodes: [],
+                edges: [],
+                logs: [],
+                prompt: '',
+                isRunning: false,
+                reportContent: '',
+                instance: null,
+
+                init() {
+                    this.instance = jsPlumbBrowserUI.newInstance({
+                        container: document.getElementById("canvas"),
+                        dragOptions: { cursor: 'grab' },
+                        connectionOverlays: [
+                            { type: "Arrow", options: { location: 1, width: 10, length: 10, fill: "#6366f1" } }
+                        ],
+                        connector: { type: "Bezier", options: { curviness: 50 } },
+                        paintStyle: { stroke: "#6366f1", strokeWidth: 2 },
+                        endpointStyle: { fill: "#6366f1", radius: 4 }
+                    });
+
+                    this.instance.bind("connection", (info) => {
+                        this.addEdge(info.sourceId, info.targetId);
+                    });
+
+                    this.instance.bind("connectionDetached", (info) => {
+                        this.removeEdge(info.sourceId, info.targetId);
+                    });
+
+                    // Load Demo on first visit
+                    setTimeout(() => {
+                        if (this.nodes.length === 0) {
+                            this.loadDemo();
+                        }
+                    }, 100);
+                },
+
+                loadDemo() {
+                    const demoNodes = [
+                        { id: 'node-1', type: 'Researcher', x: 100, y: 100, data: { color: 'bg-indigo-50 border-indigo-200', icon: '🔍', text: 'text-indigo-700', system_prompt: 'You are a Senior Researcher. Find data on 2026 EV Market trends in South Africa.' } },
+                        { id: 'node-2', type: 'Writer', x: 450, y: 100, data: { color: 'bg-teal-50 border-teal-200', icon: '✍️', text: 'text-teal-700', system_prompt: 'Use the research to write a market analysis report.' } },
+                        { id: 'node-3', type: 'Critic', x: 450, y: 350, data: { color: 'bg-amber-50 border-amber-200', icon: '🧐', text: 'text-amber-700', system_prompt: 'Review the report for clarity and accuracy.' } }
+                    ];
+
+                    this.clearCanvas();
+                    this.prompt = "Analyze the EV market in South Africa for 2026.";
+
+                    // Add nodes sequentially to allow DOM render
+                    demoNodes.forEach((n, index) => {
+                        this.nodes.push(n);
+                        setTimeout(() => {
+                            const el = document.getElementById(n.id);
+                            this.instance.manage(el);
+                            this.instance.addEndpoint(el, { source: true, target: false, anchor: "Right" });
+                            this.instance.addEndpoint(el, { source: false, target: true, anchor: "Left" });
+
+                            // Connect them after nodes exist
+                            if (index > 0) {
+                                this.instance.connect({ source: demoNodes[index - 1].id, target: n.id });
+                            }
+                        }, 50 * (index + 1));
+                    });
+                },
+
+                addNode(type) {
+                    const id = `node-${Date.now()}`;
+                    const offset = 50 + (this.nodes.length * 20);
+                    const def = {
+                        'Researcher': { color: 'bg-indigo-50 border-indigo-200', icon: '🔍', text: 'text-indigo-700', system: 'You are a researcher. Search for detailed information.' },
+                        'Writer': { color: 'bg-teal-50 border-teal-200', icon: '✍️', text: 'text-teal-700', system: 'You are a writer. Create engaging content based on research.' },
+                        'Critic': { color: 'bg-amber-50 border-amber-200', icon: '🧐', text: 'text-amber-700', system: 'You are a critic. Review and improve the content.' },
+                        'Coder': { color: 'bg-violet-50 border-violet-200', icon: '💻', text: 'text-violet-700', system: 'You are a coder. Generate high-quality code.' }
+                    }[type];
+
+                    this.nodes.push({ id, type, x: 100 + offset, y: 100 + offset, data: { system_prompt: def.system, ...def } });
+
+                    setTimeout(() => {
+                        const el = document.getElementById(id);
+                        this.instance.manage(el);
+                        this.instance.addEndpoint(el, { source: true, target: false, anchor: "Right" });
+                        this.instance.addEndpoint(el, { source: false, target: true, anchor: "Left" });
+                    }, 50);
+                },
+
+                removeNode(id) {
+                    this.instance.remove(document.getElementById(id));
+                    this.nodes = this.nodes.filter(n => n.id !== id);
+                    this.edges = this.edges.filter(e => e.source !== id && e.target !== id);
+                },
+
+                addEdge(source, target) {
+                    if (!this.edges.find(e => e.source === source && e.target === target)) this.edges.push({ source, target });
+                },
+
+                removeEdge(source, target) {
+                    this.edges = this.edges.filter(e => !(e.source === source && e.target === target));
+                },
+
+                clearCanvas() {
+                    this.instance.deleteEveryConnection();
+                    // Remove all managed elements
+                    this.nodes.forEach(n => this.instance.remove(document.getElementById(n.id)));
+                    this.nodes = [];
+                    this.edges = [];
+                    this.logs = [];
+                    this.reportContent = '';
+                },
+
+                saveWorkflow() {
+                    const data = {
+                        nodes: this.nodes,
+                        edges: this.edges,
+                        prompt: this.prompt
+                    };
+                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `workflow-${Date.now()}.json`;
+                    a.click();
+                },
+
+                loadWorkflow() {
+                    const input = document.createElement('input');
+                    input.type = 'file';
+                    input.accept = 'application/json';
+                    input.onchange = e => {
+                        const file = e.target.files[0];
+                        const reader = new FileReader();
+                        reader.onload = event => {
+                            const data = JSON.parse(event.target.result);
+                            this.clearCanvas();
+                            this.prompt = data.prompt || "";
+
+                            // Rehydrate nodes
+                            data.nodes.forEach((n, i) => {
+                                this.nodes.push(n);
+                                setTimeout(() => {
+                                    const el = document.getElementById(n.id);
+                                    if (el) {
+                                        this.instance.manage(el);
+                                        this.instance.addEndpoint(el, { source: true, target: false, anchor: "Right" });
+                                        this.instance.addEndpoint(el, { source: false, target: true, anchor: "Left" });
+                                    }
+                                }, 50);
+                            });
+
+                            // Rehydrate edges (delayed to ensure endpoints exist)
+                            setTimeout(() => {
+                                data.edges.forEach(e => {
+                                    this.instance.connect({ source: e.source, target: e.target });
+                                });
+                            }, 200 + (data.nodes.length * 20));
+                        };
+                        reader.readAsText(file);
+                    };
+                    input.click();
+                },
+
+                clearLogs() { this.logs = []; this.reportContent = ''; },
+
+                addLog(text, type = 'info', agent = 'System') {
+                    if (type === 'info' && agent !== 'System') this.reportContent += text;
+                    const lastLog = this.logs[this.logs.length - 1];
+                    if (lastLog && lastLog.agent === agent && type === 'info') lastLog.message += text;
+                    else this.logs.push({ message: text, type, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }), agent });
+                    setTimeout(() => { const c = document.getElementById('logs-container'); if (c) c.scrollTop = c.scrollHeight; }, 10);
+                },
+
+                downloadReport() {
+                    const blob = new Blob([this.reportContent], { type: 'text/markdown' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = `report-${Date.now()}.md`; a.click();
+                },
+
+                async runWorkflow() {
+                    if (this.nodes.length === 0) { this.addLog("No agents on canvas.", "error"); return; }
+                    this.isRunning = true; this.clearLogs(); this.addLog(`Starting...`, "info", "System");
+                    try {
+                        const response = await fetch('http://localhost:8000/run', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                workflow: {
+                                    nodes: this.nodes.map(n => ({ id: n.id, type: 'agent', data: n.data, position: { x: n.x, y: n.y } })),
+                                    edges: this.edges.map(e => ({ id: `${e.source}-${e.target}`, source: e.source, target: e.target }))
+                                }, prompt: this.prompt
+                            })
+                        });
+                        const reader = response.body.getReader(); const decoder = new TextDecoder();
+                        while (true) {
+                            const { value, done } = await reader.read(); if (done) break;
+                            const chunks = decoder.decode(value).split('\n\n');
+                            chunks.forEach(chunk => {
+                                if (chunk.startsWith('data: ')) {
+                                    try {
+                                        const event = JSON.parse(chunk.replace('data: ', ''));
+                                        const typeMap = { 'thought': 'info', 'error': 'error', 'success': 'success', 'info': 'info' };
+                                        this.addLog(event.text, typeMap[event.type] || 'info', event.agent);
+                                    } catch (e) { }
+                                }
+                            });
+                        }
+                    } catch (error) { this.addLog(`Error: ${error.message}`, "error", "System"); }
+                    finally { this.isRunning = false; this.addLog("Done.", "success", "System"); }
+                }
+            });
+        });
+    </script>
+</head>
+
+<body class="bg-gray-50 h-screen flex flex-col overflow-hidden text-sm text-gray-700" x-data>
+
+    <!-- Header -->
+    <header
+        class="h-14 bg-white border-b border-gray-200 flex items-center justify-between px-6 z-20 shadow-sm shrink-0">
+        <div class="flex items-center gap-3">
+            <div
+                class="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold shadow-indigo-200 shadow-md">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+                </svg>
+            </div>
+            <span class="text-lg font-bold text-gray-800 tracking-tight">AgentForge</span>
+        </div>
+        <div class="flex items-center gap-3">
+            <button @click="$store.workflow.saveWorkflow()"
+                class="text-gray-500 hover:text-indigo-600 px-3 py-1.5 rounded-md hover:bg-indigo-50 transition-colors text-xs font-medium flex items-center gap-1">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                    <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                    <polyline points="7 3 7 8 15 8"></polyline>
+                </svg>
+                Save
+            </button>
+            <button @click="$store.workflow.loadWorkflow()"
+                class="text-gray-500 hover:text-indigo-600 px-3 py-1.5 rounded-md hover:bg-indigo-50 transition-colors text-xs font-medium flex items-center gap-1">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="17 8 12 3 7 8"></polyline>
+                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                </svg>
+                Load
+            </button>
+            <div class="h-4 w-px bg-gray-300 mx-1"></div>
+            <a href="https://github.com/agentforge/agentforge" target="_blank"
+                class="text-gray-400 hover:text-gray-900 transition-colors">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path
+                        d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" />
+                </svg>
+            </a>
+        </div>
+    </header>
+
+    <div class="flex-1 flex overflow-hidden">
+        <aside class="w-64 bg-white border-r border-gray-200 flex flex-col z-10 shrink-0">
+            <div class="p-4 border-b border-gray-100">
+                <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Components</h2>
+            </div>
+            <div class="p-4 space-y-3">
+                <template x-for="agent in ['Researcher', 'Writer', 'Critic', 'Coder']">
+                    <button @click="$store.workflow.addNode(agent)"
+                        class="w-full text-left bg-indigo-600 text-white rounded-lg p-3 hover:bg-indigo-700 hover:shadow-lg hover:-translate-y-0.5 transition-all duration-200 flex items-center gap-3 group">
+                        <span class="text-xl group-hover:scale-110 transition-transform"
+                            x-text="{ 'Researcher': '🔍', 'Writer': '✍️', 'Critic': '🧐', 'Coder': '💻' }[agent]"></span>
+                        <div class="flex-1">
+                            <div class="font-semibold" x-text="agent"></div>
+                            <div class="text-xs text-indigo-200 opacity-80 font-light">Add Agent</div>
+                        </div>
+                    </button>
+                </template>
+            </div>
+        </aside>
+
+        <main class="flex-1 relative overflow-hidden bg-gray-50 flex flex-col">
+            <div id="canvas" class="flex-1 relative bg-grid cursor-crosshair" @dblclick.self="">
+                <div class="absolute inset-0 flex items-center justify-center pointer-events-none"
+                    x-show="$store.workflow.nodes.length === 0">
+                    <div class="text-center opacity-40">
+                        <svg class="w-16 h-16 mx-auto text-gray-400 mb-2" xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+                            <rect x="2" y="10" width="20" height="8" rx="2" ry="2" />
+                            <path d="M12 2v20" />
+                        </svg>
+                        <p class="text-gray-500 font-medium">Drag agents to build (or load demo)</p>
+                    </div>
+                </div>
+                <template x-for="node in $store.workflow.nodes" :key="node.id">
+                    <div :id="node.id"
+                        class="absolute w-72 rounded-xl border shadow-sm hover:shadow-xl transition-all duration-200 flex flex-col z-20 group bg-white"
+                        :class="node.data.color" :style="`left: ${node.x}px; top: ${node.y}px;`">
+                        <div class="p-3 border-b flex justify-between items-center bg-opacity-50 cursor-grab active:cursor-grabbing rounded-t-xl"
+                            :class="node.data.text.replace('text-', 'bg-').replace('700', '100')">
+                            <div class="flex items-center gap-2"><span class="text-lg"
+                                    x-text="node.data.icon"></span><span class="font-bold tracking-tight"
+                                    :class="node.data.text" x-text="node.type"></span></div>
+                            <button @click="$store.workflow.removeNode(node.id)"
+                                class="text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"><svg
+                                    xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+                                    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    stroke-linejoin="round">
+                                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                                </svg></button>
+                        </div>
+                        <div class="p-4 bg-white rounded-b-xl">
+                            <label class="block text-xs font-semibold text-gray-500 uppercase mb-2">System
+                                Prompt</label>
+                            <textarea x-model="node.data.system_prompt" rows="3"
+                                class="w-full text-xs text-gray-600 border border-gray-200 rounded-md p-2 focus:ring-2 focus:ring-indigo-500 outline-none resize-none bg-gray-50"></textarea>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <div class="absolute bottom-6 left-1/2 transform -translate-x-1/2 w-full max-w-2xl px-4 z-50">
+                <div
+                    class="bg-white/90 backdrop-blur-md rounded-2xl shadow-xl border border-gray-200 p-2 flex gap-2 items-center">
+                    <input type="text" x-model="$store.workflow.prompt" placeholder="Describe workflow task..."
+                        class="flex-1 bg-transparent border-none focus:ring-0 text-gray-700 placeholder-gray-400 text-sm h-10 px-2">
+                    <div x-show="!$store.workflow.isRunning && $store.workflow.reportContent"
+                        class="animate-fade-in-up">
+                        <button @click="$store.workflow.downloadReport()"
+                            class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2.5 rounded-xl font-medium text-sm transition-all"
+                            title="Download Report"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+                                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="7 10 12 15 17 10"></polyline>
+                                <line x1="12" y1="15" x2="12" y2="3"></line>
+                            </svg></button>
+                    </div>
+                    <button @click="$store.workflow.runWorkflow()" :disabled="$store.workflow.isRunning"
+                        class="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl font-semibold text-sm transition-all shadow-lg hover:shadow-indigo-300 disabled:opacity-50 flex items-center gap-2">
+                        <span x-show="!$store.workflow.isRunning">Run</span><span
+                            x-show="$store.workflow.isRunning">Running</span>
+                        <svg x-show="!$store.workflow.isRunning" xmlns="http://www.w3.org/2000/svg" width="16"
+                            height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                        </svg>
+                        <svg x-show="$store.workflow.isRunning" class="animate-spin h-4 w-4"
+                            xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4">
+                            </circle>
+                            <path class="opacity-75" fill="currentColor"
+                                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
+                            </path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </main>
+
+        <aside class="w-80 bg-white border-l border-gray-200 flex flex-col shrink-0 z-10 shadow-lg">
+            <div class="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+                <h2 class="text-xs font-bold text-gray-500 uppercase tracking-wider">Execution Logs</h2>
+                <button @click="$store.workflow.clearLogs()"
+                    class="text-xs text-gray-400 hover:text-gray-600">Clear</button>
+            </div>
+            <div id="logs-container" class="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50/30 scroll-smooth">
+                <template x-if="$store.workflow.logs.length === 0 && !$store.workflow.isRunning">
+                    <div class="h-64 flex flex-col items-center justify-center text-gray-300">
+                        <p class="text-sm">Ready to forge.</p>
+                    </div>
+                </template>
+                <template x-for="(log, index) in $store.workflow.logs" :key="index">
+                    <div class="flex gap-3 animate-fade-in-up">
+                        <div class="mt-1 flex-shrink-0">
+                            <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shadow-sm ring-2 ring-white"
+                                :class="{'bg-indigo-500': log.agent.includes('Researcher'), 'bg-teal-500': log.agent.includes('Writer'), 'bg-amber-500': log.agent.includes('Critic'), 'bg-violet-500': log.agent.includes('Coder'), 'bg-gray-400': !['Researcher', 'Writer', 'Critic', 'Coder'].some(r => log.agent.includes(r))}">
+                                <span x-text="log.agent[0]"></span></div>
+                        </div>
+                        <div class="flex-1 relative group">
+                            <div class="flex items-baseline justify-between mb-1 pl-1"><span
+                                    class="text-xs font-bold text-gray-700" x-text="log.agent"></span><span
+                                    class="text-[10px] text-gray-400" x-text="log.timestamp"></span></div>
+                            <div class="bg-white p-3 rounded-2xl rounded-tl-none border border-gray-100 shadow-sm text-xs leading-relaxed"
+                                :class="{'border-red-100 bg-red-50': log.type === 'error', 'border-green-100 bg-green-50': log.type === 'success'}">
+                                <p class="text-gray-600 whitespace-pre-wrap" x-text="log.message"></p>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+                <div x-show="$store.workflow.isRunning" class="flex gap-3 animate-fade-in-up opacity-80" x-transition>
+                    <div class="mt-1">
+                        <div
+                            class="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center ring-2 ring-white">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+                                fill="none" stroke="currentColor" stroke-width="2" class="text-gray-400">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <polyline points="12 6 12 12 16 14"></polyline>
+                            </svg></div>
+                    </div>
+                    <div
+                        class="bg-white p-3 rounded-2xl rounded-tl-none border border-gray-100 shadow-sm flex items-center gap-1 w-16">
+                        <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
+                        <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
+                        <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </div>
+</body>
+
+</html>
