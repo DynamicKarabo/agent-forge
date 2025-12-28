@@ -198,6 +198,9 @@
                 theme: localStorage.getItem('agentforge_theme') || 'light',
                 showWelcome: !localStorage.getItem('agentforge_onboarded'),
 
+                // Drag & Drop
+                isDragOver: false,
+
                 // Shortcuts & History
                 showShortcuts: false,
                 history: [],
@@ -256,6 +259,12 @@
                         const existing = this.edges.find(e => e.source === source && e.target === target);
                         if (existing) return false;
 
+                        // Cycle Detection
+                        if (this.detectCycle(source, target)) {
+                            this.notify("Cannot create cycle!", "error");
+                            return false;
+                        }
+
                         return true;
                     });
 
@@ -303,7 +312,26 @@
 
                     // Validation Watcher
                     this.$watch('nodes', () => this.validateWorkflow());
+                    this.$watch('nodes', () => this.validateWorkflow());
                     this.$watch('edges', () => this.validateWorkflow());
+
+                    // Global Key Listener for Delete
+                    document.addEventListener('keydown', (e) => {
+                        if ((e.key === 'Delete' || e.key === 'Backspace') && this.selectedNode && !this.editingNode) {
+                            // Don't delete if user is typing in an input
+                            if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA' || document.activeElement.isContentEditable) return;
+                            this.deleteSelected();
+                        }
+                        // Undo/Redo Shortcuts
+                        if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+                            e.preventDefault();
+                            this.undo();
+                        }
+                        if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
+                            e.preventDefault();
+                            this.redo();
+                        }
+                    });
                 },
 
                 // History & Undo/Redo
@@ -417,6 +445,56 @@
                     };
                 },
 
+                // Core Interactions
+                detectCycle(source, target) {
+                    // Check if target can reach source
+                    const stack = [target];
+                    const visited = new Set();
+                    while (stack.length > 0) {
+                        const curr = stack.pop();
+                        if (curr === source) return true;
+                        if (visited.has(curr)) continue;
+                        visited.add(curr);
+                        const children = this.edges.filter(e => e.source === curr).map(e => e.target);
+                        stack.push(...children);
+                    }
+                    return false;
+                },
+
+                deleteSelected() {
+                    if (!this.selectedNode) return;
+                    if (confirm("Delete selected node and interactions?")) {
+                        this.removeNode(this.selectedNode);
+                        this.selectedNode = null;
+                    }
+                },
+
+                removeNode(id) {
+                    const node = this.nodes.find(n => n.id === id);
+                    if (!node) return;
+
+                    // Find connected edges
+                    const connectedEdges = this.edges.filter(e => e.source === id || e.target === id);
+
+                    // Record action
+                    this.record({
+                        type: 'del-node',
+                        node: JSON.parse(JSON.stringify(node)),
+                        edges: JSON.parse(JSON.stringify(connectedEdges))
+                    });
+
+                    // Update model
+                    this.edges = this.edges.filter(e => e.source !== id && e.target !== id);
+                    this.nodes = this.nodes.filter(n => n.id !== id);
+
+                    // Cleanup jsPlumb (important!)
+                    this.instance.remove(id);
+                    // Also need to remove connections from jsPlumb visual state?
+                    // instance.remove(id) usually handles it.
+
+                    this.notify("Node deleted");
+                },
+
                 // Persistence Logic
                 autoSave() {
                     const data = this.getWorkflowData();
@@ -510,6 +588,60 @@
                     this.setZoom(1);
                 },
 
+                fitView() {
+                    if (this.nodes.length === 0) {
+                        this.centerCanvas();
+                        return;
+                    }
+
+                    // Box calc
+                    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+                    this.nodes.forEach(n => {
+                        minX = Math.min(minX, n.x);
+                        maxX = Math.max(maxX, n.x + 200); // 200 approx width
+                        minY = Math.min(minY, n.y);
+                        maxY = Math.max(maxY, n.y + 100); // 100 approx height
+                    });
+
+                    const canvas = document.getElementById('canvas');
+                    const w = canvas.clientWidth;
+                    const h = canvas.clientHeight;
+
+                    const padding = 50;
+                    const contentW = maxX - minX + padding * 2;
+                    const contentH = maxY - minY + padding * 2;
+
+                    const scaleW = w / contentW;
+                    const scaleH = h / contentH;
+
+                    let newZoom = Math.min(scaleW, scaleH);
+                    newZoom = Math.min(Math.max(newZoom, 0.5), 1.5); // Clamp
+
+                    this.setZoom(newZoom);
+
+                    // Center
+                    const contentCenterX = minX + (maxX - minX) / 2;
+                    const contentCenterY = minY + (maxY - minY) / 2;
+
+                    // Pan so that contentCenter matches ViewCenter (w/2, h/2)
+                    // ViewCenter = (ContentPos + Pan) * Zoom ? No, logic is:
+                    // transform: translate(panX, panY) scale(zoom)
+                    // We want screen centered on contentCenter.
+
+                    // Pan X = (ScreenW / 2) / Zoom - ContentCenter
+                    // Actually simplier: pan so content top-left is at...
+                    // Let's rely on visual center:
+
+                    this.pan.x = (w / 2 / newZoom) - contentCenterX;
+                    this.pan.y = (h / 2 / newZoom) - contentCenterY;
+                },
+
+                confirmClear() {
+                    if (confirm("Are you sure you want to clear the canvas?")) {
+                        this.clearCanvas();
+                    }
+                },
+
                 loadDemo() {
                     const icons = {
                         'Researcher': `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
@@ -543,19 +675,25 @@
                     }, 300);
                 },
 
-                addNode(type, existingNode = null) {
+                addNode(type, existingNode = null, x = null, y = null) {
                     let node;
                     if (existingNode) {
                         node = existingNode;
                         this.nodes.push(node);
                     } else {
                         const id = `node-${Date.now()}`;
-                        // Auto-positioning logic
-                        let startX = 100;
-                        let startY = 100;
-                        if (this.nodes.length > 0) {
-                            // First node center-ish relative to current pan? 
-                            // Actually just keeping 100,100 makes sense for 0,0 origin
+                        // Auto-positioning logic: Cascade if no X/Y provided
+                        let startX = x;
+                        let startY = y;
+
+                        if (startX === null || startY === null) {
+                            startX = 300;
+                            startY = 200;
+                            if (this.nodes.length > 0) {
+                                const lastNode = this.nodes[this.nodes.length - 1];
+                                startX = lastNode.x + 180;
+                                startY = lastNode.y + 120;
+                            }
                         }
 
                         const icons = {
@@ -574,10 +712,30 @@
 
                         node = { id, type, x: startX, y: startY, data: { system_prompt: def.system, ...def } };
                         this.nodes.push(node);
+                        node = { id, type, x: startX, y: startY, data: { system_prompt: def.system, ...def } };
+                        this.nodes.push(node);
                         this.record({ type: 'add-node', node: JSON.parse(JSON.stringify(node)) });
+                        this.saveState();
+
+                        // Notify user
+                        this.notify(`Added ${type}`, 'success');
                     }
 
                     this.$nextTick(() => { this.setupNode(node.id); });
+                },
+
+                handleDrop(e) {
+                    this.isDragOver = false;
+                    const type = e.dataTransfer.getData('type');
+                    if (!type) return;
+
+                    const canvasRect = document.getElementById('canvas').getBoundingClientRect();
+
+                    // precise calculation: (clientPos - containerPos - panOffset) / zoomScale
+                    const x = (e.clientX - canvasRect.left - this.pan.x) / this.zoom;
+                    const y = (e.clientY - canvasRect.top - this.pan.y) / this.zoom;
+
+                    this.addNode(type, null, x, y);
                 },
 
                 setupNode(id) {
@@ -647,15 +805,30 @@
                     const node = this.nodes.find(n => n.id === id);
                     if (!node) return;
 
-                    // Record before deleting
-                    const relatedEdges = this.edges.filter(e => e.source === id || e.target === id);
-                    this.record({ type: 'del-node', node: JSON.parse(JSON.stringify(node)), edges: relatedEdges });
+                    // Find connected edges
+                    const connectedEdges = this.edges.filter(e => e.source === id || e.target === id);
 
-                    const el = document.getElementById(id);
-                    if (el) this.instance.remove(el);
+                    // Record action
+                    this.record({
+                        type: 'del-node',
+                        node: JSON.parse(JSON.stringify(node)),
+                        edges: JSON.parse(JSON.stringify(connectedEdges))
+                    });
 
-                    this.nodes = this.nodes.filter(n => n.id !== id);
+                    // Update model
                     this.edges = this.edges.filter(e => e.source !== id && e.target !== id);
+                    this.nodes = this.nodes.filter(n => n.id !== id);
+
+                    // Cleanup jsPlumb (important!)
+                    // Cleanup jsPlumb (important!)
+                    this.instance.remove(id);
+
+                    this.saveState();
+
+                    // Remove dropped node from selection if needed
+                    if (this.selectedNode === id) this.selectedNode = null;
+
+                    this.notify("Node deleted");
                 },
 
                 removeEdge(source, target) {
@@ -668,6 +841,7 @@
                     // Also Update jsPlumb if called programmatically, not via event
                     const conns = this.instance.getConnections({ source: source, target: target });
                     if (conns.length) this.instance.deleteConnection(conns[0]);
+                    this.saveState();
                 },
 
                 addEdge(source, target, isProgrammatic = false) {
@@ -676,6 +850,7 @@
                         if (!isProgrammatic) {
                             // Link UI already there via jsPlumb, but we need to record it
                             this.record({ type: 'add-edge', source, target });
+                            this.saveState();
                         } else {
                             // Restore visual connection if programmatic (undo/redo or load)
                             const src = document.querySelector(`#${source} .output`);
@@ -797,6 +972,12 @@
                 },
 
                 async runWorkflow() {
+                    if (this.isRunning && this.isPaused) {
+                        this.isPaused = false;
+                        this.notify("Resuming workflow...");
+                        return;
+                    }
+
                     this.validateWorkflow();
                     if (!this.validationStatus.valid) {
                         this.notify("Cannot run: Workflow has errors.", "error");
@@ -868,17 +1049,30 @@
                         try {
                             await this.executeNode(node);
                             node.status = 'success';
+
                         } catch (err) {
                             node.status = 'error';
-                            this.notify(`Error at ${node.type}: ${err.message}`, 'error');
-                            // Determine if we stop or continue? Stop.
-                            this.isRunning = false;
-                            break;
+                            const isNetwork = err.message.includes("Network") || err.message.includes("Connection");
+                            const msg = isNetwork ? "Connection lost. Click to retry." : `Error: ${err.message}`;
+                            this.notify(msg, 'error');
+
+                            // Pause on error to allow retry
+                            this.isPaused = true;
+                            // Do not break immediately if we want to allow Resume? 
+                            // But simple loop breaks. To "Resume", user clicks Run again.
+                            // If we break loop, `isRunning` becomes false.
+                            // User wants "Retry Button".
+                            // If we keep `isRunning = true` but `isPaused = true`, the loop waits.
+                            // Modified loop logic above: `while (this.isPaused && this.isRunning)`
+                            // So if we set paused, it waits. User clicks "Resume" which toggles pause?
+
+                            // Let's implement specific "Retry" UI action.
                         }
                     }
 
                     this.activeNodeId = null;
-                    if (this.isRunning) {
+                    if (this.isRunning && !this.isPaused) {
+                        // Only finish if not paused (which implies error or step mode)
                         this.notify("Workflow completed successfully!");
                         this.isRunning = false;
                     }
@@ -889,14 +1083,28 @@
                     this.addLog(`Executing ${node.type}...`, "info", "System");
 
                     try {
-                        const response = await fetch('http://localhost:8000/run_node', {
-                            method: 'POST', headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                agent_config: { name: node.type, system_prompt: node.data.system_prompt },
-                                history: this.executionHistory,
-                                prompt: this.prompt // Initial prompt, history carries context
-                            })
-                        });
+                        let response;
+                        try {
+                            response = await fetch('http://localhost:8000/run_node', {
+                                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    agent_config: { name: node.type, system_prompt: node.data.system_prompt },
+                                    history: this.executionHistory,
+                                    prompt: this.prompt // Initial prompt, history carries context
+                                })
+                            });
+                        } catch (netErr) {
+                            throw new Error("Network failure. Check connection.");
+                        }
+
+                        if (!response.ok) {
+                            // Try to read error text
+                            const errText = await response.text();
+                            if (response.status === 401 || errText.includes("API key")) {
+                                throw new Error("Missing Groq API Key. Set in .env file.");
+                            }
+                            throw new Error(`Server Error (${response.status}): ${errText}`);
+                        }
 
                         const reader = response.body.getReader();
                         const decoder = new TextDecoder();
@@ -948,7 +1156,7 @@
     x-data @keydown.window.delete="$store.workflow.promptDelete()"
     @keydown.window.backspace="$store.workflow.promptDelete()"
     @keydown.escape.window="$store.workflow.clearSelection(); $store.workflow.showConfigPanel = false; $store.workflow.showDeleteConfirm = false; $store.workflow.showShortcuts = false;"
-    @keydown.space.window.prevent @keydown.window="
+    @keydown.window="
         if (($event.ctrlKey || $event.metaKey) && $event.key === 's') { $event.preventDefault(); $store.workflow.saveWorkflow(); }
         if (($event.ctrlKey || $event.metaKey) && $event.key === 'z') { $event.preventDefault(); $store.workflow.undo(); }
         if (($event.ctrlKey || $event.metaKey) && $event.key === 'y') { $event.preventDefault(); $store.workflow.redo(); }
@@ -1020,7 +1228,51 @@
             </div>
         </div>
 
-        <div class="flex items-center gap-4">
+        <div class="flex items-center gap-2">
+            <!-- Toolbar Actions (Undo/Redo/Fit/Clear) -->
+            <div class="flex items-center bg-gray-100 dark:bg-slate-700 rounded-lg p-1 gap-0.5 mr-2">
+                <button @click="$store.workflow.undo()" :disabled="$store.workflow.history.length === 0"
+                    class="p-1.5 text-gray-500 hover:text-indigo-600 dark:text-gray-400 dark:hover:text-indigo-300 rounded hover:bg-white dark:hover:bg-slate-600 transition-all disabled:opacity-30"
+                    title="Undo (Ctrl+Z)">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M3 7v6h6"></path>
+                        <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path>
+                    </svg>
+                </button>
+                <button @click="$store.workflow.redo()" :disabled="$store.workflow.future.length === 0"
+                    class="p-1.5 text-gray-500 hover:text-indigo-600 dark:text-gray-400 dark:hover:text-indigo-300 rounded hover:bg-white dark:hover:bg-slate-600 transition-all disabled:opacity-30"
+                    title="Redo (Ctrl+Y)">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 7v6h-6"></path>
+                        <path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3l3 3.7"></path>
+                    </svg>
+                </button>
+                <div class="w-px h-4 bg-gray-300 dark:bg-slate-600 mx-1"></div>
+                <button @click="$store.workflow.fitView()"
+                    class="p-1.5 text-gray-500 hover:text-indigo-600 dark:text-gray-400 dark:hover:text-indigo-300 rounded hover:bg-white dark:hover:bg-slate-600 transition-all"
+                    title="Fit to View">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="15 3 21 3 21 9"></polyline>
+                        <polyline points="9 21 3 21 3 15"></polyline>
+                        <line x1="21" y1="3" x2="14" y2="10"></line>
+                        <line x1="3" y1="21" x2="10" y2="14"></line>
+                    </svg>
+                </button>
+                <button @click="$store.workflow.confirmClear()"
+                    class="p-1.5 text-gray-500 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400 rounded hover:bg-white dark:hover:bg-slate-600 transition-all"
+                    title="Clear Canvas">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M3 6h18"></path>
+                        <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path>
+                        <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path>
+                    </svg>
+                </button>
+            </div>
+
             <!-- Validation Badge -->
             <button @click="$store.workflow.showValidationPanel = !$store.workflow.showValidationPanel"
                 class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold transition-all"
@@ -1076,11 +1328,14 @@
                 <h2 class="text-xs font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-4">Agent
                     Library</h2>
                 <div class="grid grid-cols-2 gap-3">
-                    <div draggable="true"
+                    <div draggable="true" @click="$store.workflow.addNode('Researcher')"
                         @dragstart="$event.dataTransfer.setData('type', 'Researcher'); $event.dataTransfer.effectAllowed = 'copy';"
-                        class="p-3 bg-indigo-50 dark:bg-slate-700/50 border border-indigo-100 dark:border-slate-600 rounded-xl cursor-grab hover:shadow-md hover:border-indigo-300 dark:hover:border-indigo-500 transition-all group">
+                        class="p-3 bg-indigo-50 dark:bg-slate-700/50 border border-indigo-100 dark:border-slate-600 rounded-xl cursor-copy hover:scale-105 active:scale-95 hover:shadow-md hover:border-indigo-300 dark:hover:border-indigo-500 transition-all duration-200 group relative">
                         <div
-                            class="text-indigo-600 dark:text-indigo-400 mb-2 group-hover:scale-110 transition-transform">
+                            class="absolute -top-2 -right-2 bg-indigo-600 text-white text-[10px] px-1.5 py-0.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-sm">
+                            Add</div>
+                        <div
+                            class="text-indigo-600 dark:text-indigo-400 mb-2 group-hover:rotate-12 transition-transform">
                             <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
                                 fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
                                 stroke-linejoin="round">
@@ -1090,10 +1345,13 @@
                         </div>
                         <span class="font-semibold text-indigo-900 dark:text-indigo-100 text-xs block">Researcher</span>
                     </div>
-                    <div draggable="true"
+                    <div draggable="true" @click="$store.workflow.addNode('Writer')"
                         @dragstart="$event.dataTransfer.setData('type', 'Writer'); $event.dataTransfer.effectAllowed = 'copy';"
-                        class="p-3 bg-teal-50 dark:bg-slate-700/50 border border-teal-100 dark:border-slate-600 rounded-xl cursor-grab hover:shadow-md hover:border-teal-300 dark:hover:border-teal-500 transition-all group">
-                        <div class="text-teal-600 dark:text-teal-400 mb-2 group-hover:scale-110 transition-transform">
+                        class="p-3 bg-teal-50 dark:bg-slate-700/50 border border-teal-100 dark:border-slate-600 rounded-xl cursor-copy hover:scale-105 active:scale-95 hover:shadow-md hover:border-teal-300 dark:hover:border-teal-500 transition-all duration-200 group relative">
+                        <div
+                            class="absolute -top-2 -right-2 bg-teal-600 text-white text-[10px] px-1.5 py-0.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-sm">
+                            Add</div>
+                        <div class="text-teal-600 dark:text-teal-400 mb-2 group-hover:rotate-12 transition-transform">
                             <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
                                 fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
                                 stroke-linejoin="round">
@@ -1103,10 +1361,13 @@
                         </div>
                         <span class="font-semibold text-teal-900 dark:text-teal-100 text-xs block">Writer</span>
                     </div>
-                    <div draggable="true"
+                    <div draggable="true" @click="$store.workflow.addNode('Critic')"
                         @dragstart="$event.dataTransfer.setData('type', 'Critic'); $event.dataTransfer.effectAllowed = 'copy';"
-                        class="p-3 bg-amber-50 dark:bg-slate-700/50 border border-amber-100 dark:border-slate-600 rounded-xl cursor-grab hover:shadow-md hover:border-amber-300 dark:hover:border-amber-500 transition-all group">
-                        <div class="text-amber-600 dark:text-amber-400 mb-2 group-hover:scale-110 transition-transform">
+                        class="p-3 bg-amber-50 dark:bg-slate-700/50 border border-amber-100 dark:border-slate-600 rounded-xl cursor-copy hover:scale-105 active:scale-95 hover:shadow-md hover:border-amber-300 dark:hover:border-amber-500 transition-all duration-200 group relative">
+                        <div
+                            class="absolute -top-2 -right-2 bg-amber-600 text-white text-[10px] px-1.5 py-0.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-sm">
+                            Add</div>
+                        <div class="text-amber-600 dark:text-amber-400 mb-2 group-hover:rotate-12 transition-transform">
                             <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
                                 fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
                                 stroke-linejoin="round">
@@ -1117,11 +1378,14 @@
                         </div>
                         <span class="font-semibold text-amber-900 dark:text-amber-100 text-xs block">Critic</span>
                     </div>
-                    <div draggable="true"
+                    <div draggable="true" @click="$store.workflow.addNode('Coder')"
                         @dragstart="$event.dataTransfer.setData('type', 'Coder'); $event.dataTransfer.effectAllowed = 'copy';"
-                        class="p-3 bg-violet-50 dark:bg-slate-700/50 border border-violet-100 dark:border-slate-600 rounded-xl cursor-grab hover:shadow-md hover:border-violet-300 dark:hover:border-violet-500 transition-all group">
+                        class="p-3 bg-violet-50 dark:bg-slate-700/50 border border-violet-100 dark:border-slate-600 rounded-xl cursor-copy hover:scale-105 active:scale-95 hover:shadow-md hover:border-violet-300 dark:hover:border-violet-500 transition-all duration-200 group relative">
                         <div
-                            class="text-violet-600 dark:text-violet-400 mb-2 group-hover:scale-110 transition-transform">
+                            class="absolute -top-2 -right-2 bg-violet-600 text-white text-[10px] px-1.5 py-0.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-sm">
+                            Add</div>
+                        <div
+                            class="text-violet-600 dark:text-violet-400 mb-2 group-hover:rotate-12 transition-transform">
                             <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
                                 fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
                                 stroke-linejoin="round">
@@ -1133,231 +1397,288 @@
                     </div>
                 </div>
             </div>
-        </aside>
+    </div>
+    </div>
+    </aside>
 
-        <main class="flex-1 relative overflow-hidden bg-gray-50 flex flex-col">
-            <div id="canvas" class="flex-1 relative overflow-hidden cursor-crosshair active:cursor-grabbing"
-                @mousedown="$store.workflow.startPan($event)" @mousemove="$store.workflow.doPan($event)"
-                @mouseup="$store.workflow.endPan()" @mouseleave="$store.workflow.endPan()"
-                @wheel="$store.workflow.handleWheel($event)" @dblclick.self="$store.workflow.clearSelection()"
-                @click.self="$store.workflow.clearSelection()">
+    <main class="flex-1 relative overflow-hidden bg-gray-50 flex flex-col">
+        <!-- Top Toolbar -->
 
-                <!-- Transform Layer -->
-                <div id="canvas-layer" class="bg-grid"
-                    :style="`transform: translate(${$store.workflow.pan.x}px, ${$store.workflow.pan.y}px) scale(${$store.workflow.zoom})`">
+        <div id="canvas" class="flex-1 relative overflow-hidden cursor-crosshair active:cursor-grabbing"
+            @mousedown="$store.workflow.startPan($event)" @mousemove="$store.workflow.doPan($event)"
+            @mouseup="$store.workflow.endPan()"
+            @mouseleave="$store.workflow.endPan(); $store.workflow.isDragOver = false"
+            @wheel="$store.workflow.handleWheel($event)" @dblclick.self="$store.workflow.clearSelection()"
+            @click.self="$store.workflow.clearSelection()"
+            @dragover.prevent="$store.workflow.isDragOver = true; $event.dataTransfer.dropEffect = 'copy'"
+            @drop.prevent="$store.workflow.handleDrop($event)">
 
-                    <div class="absolute inset-0 flex items-center justify-center pointer-events-none"
-                        x-show="$store.workflow.nodes.length === 0" style="width: 2000px; height: 1000px;">
-                        <!-- Placeholder size -->
-                        <div class="text-center opacity-40">
-                            <svg class="w-16 h-16 mx-auto text-gray-400 mb-2" xmlns="http://www.w3.org/2000/svg"
-                                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
-                                <rect x="2" y="10" width="20" height="8" rx="2" ry="2" />
-                                <path d="M12 2v20" />
-                            </svg>
-                            <p class="text-gray-500 font-medium">Drag agents to build (or load demo)</p>
-                        </div>
+            <!-- Drop Overlay -->
+            <div x-show="$store.workflow.isDragOver"
+                class="absolute inset-0 bg-indigo-500/10 pointer-events-none z-50 flex items-center justify-center backdrop-blur-[1px] transition-opacity"
+                x-transition:enter="transition ease-out duration-200" x-transition:enter-start="opacity-0"
+                x-transition:enter-end="opacity-100" x-transition:leave="transition ease-in duration-150"
+                x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0">
+                <div
+                    class="bg-white/90 dark:bg-slate-800/90 py-3 px-6 rounded-full shadow-xl border-2 border-indigo-500 text-indigo-600 dark:text-indigo-400 font-bold text-lg animate-bounce">
+                    Drop to Add Agent
+                </div>
+            </div>
+
+            <!-- Transform Layer -->
+            <div id="canvas-layer" class="bg-grid"
+                :style="`transform: translate(${$store.workflow.pan.x}px, ${$store.workflow.pan.y}px) scale(${$store.workflow.zoom})`">
+
+                <div class="absolute inset-0 flex items-center justify-center pointer-events-none"
+                    x-show="$store.workflow.nodes.length === 0" style="width: 2000px; height: 1000px;">
+                    <!-- Placeholder size -->
+                    <div class="text-center opacity-40">
+                        <svg class="w-16 h-16 mx-auto text-gray-400 mb-2" xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+                            <rect x="2" y="10" width="20" height="8" rx="2" ry="2" />
+                            <path d="M12 2v20" />
+                        </svg>
+                        <p class="text-gray-500 font-medium">Drag agents to build (or load demo)</p>
                     </div>
-                    <template x-for="node in $store.workflow.nodes" :key="node.id">
-                        <div :id="node.id"
-                            class="absolute w-72 rounded-xl border shadow-sm hover:shadow-xl transition-all duration-200 flex flex-col z-20 group bg-white"
-                            :class="[{'ring-2 ring-indigo-500 shadow-md': $store.workflow.selectedNode === node.id}, node.data.color]"
-                            :style="`left: ${node.x}px; top: ${node.y}px;`"
-                            @click.stop="$store.workflow.selectNode(node.id)"
-                            @dblclick.stop="$store.workflow.openConfig(node.id)">
+                </div>
+                <template x-for="node in $store.workflow.nodes" :key="node.id">
+                    <div :id="node.id"
+                        class="absolute w-72 rounded-xl border shadow-sm hover:shadow-xl transition-all duration-200 flex flex-col z-20 group bg-white"
+                        :class="[{'ring-2 ring-indigo-500 shadow-md': $store.workflow.selectedNode === node.id}, node.data.color]"
+                        :style="`left: ${node.x}px; top: ${node.y}px;`"
+                        @click.stop="$store.workflow.selectNode(node.id)"
+                        @dblclick.stop="$store.workflow.openConfig(node.id)">
 
-                            <!-- Ports -->
-                            <div class="port input"></div>
-                            <div class="port output"></div>
+                        <!-- Ports -->
+                        <div class="port input"></div>
+                        <div class="port output"></div>
 
-                            <!-- Status Indicator -->
-                            <div class="absolute -top-1 -right-1 w-3 h-3 rounded-full border-2 border-white z-50 shadow-sm"
-                                :class="{
+                        <!-- Status Indicator -->
+                        <div class="absolute -top-1 -right-1 w-3 h-3 rounded-full border-2 border-white z-50 shadow-sm"
+                            :class="{
                                      'bg-gray-300': !node.status || node.status === 'idle',
                                      'bg-indigo-500 animate-pulse': node.status === 'running',
                                      'bg-green-500': node.status === 'success',
                                      'bg-red-500': node.status === 'error'
                                  }"></div>
 
-                            <div class="p-3 border-b flex justify-between items-center bg-opacity-50 cursor-grab active:cursor-grabbing rounded-t-xl transition-all duration-300"
-                                :class="[
+                        <div class="p-3 border-b flex justify-between items-center bg-opacity-50 cursor-grab active:cursor-grabbing rounded-t-xl transition-all duration-300"
+                            :class="[
                                 node.data.text.replace('text-', 'bg-').replace('700', '100'), 
                                 $store.workflow.validationStatus.issues.find(i => i.id === node.id) ? 'border-amber-300' : '',
                                 $store.workflow.activeNodeId === node.id ? 'ring-2 ring-indigo-500 ring-offset-2' : ''
                             ]">
-                                <div class="flex items-center gap-2">
-                                    <span class="text-lg" x-text="node.data.icon"></span>
-                                    <span
-                                        class="font-bold tracking-tight cursor-text focus:outline-none focus:border-b focus:border-indigo-500"
-                                        :class="node.data.text" x-text="node.type" contenteditable="true"
-                                        @blur="node.type = $event.target.innerText"></span>
-                                </div>
-                                <!-- Action Buttons -->
-                                <div
-                                    class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                    <button @click.stop="$store.workflow.openConfig(node.id)"
-                                        class="text-gray-400 hover:text-indigo-600 p-1 rounded hover:bg-white/50"
-                                        title="Settings">
-                                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
-                                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                                            stroke-linecap="round" stroke-linejoin="round">
-                                            <circle cx="12" cy="12" r="3"></circle>
-                                            <path
-                                                d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
-                                            </path>
-                                        </svg>
-                                    </button>
-                                    <button
-                                        @click.stop="$store.workflow.selectNode(node.id); $store.workflow.promptDelete()"
-                                        class="text-gray-400 hover:text-red-500 p-1 rounded hover:bg-white/50"
-                                        title="Delete">
-                                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
-                                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                                            stroke-linecap="round" stroke-linejoin="round">
-                                            <line x1="18" y1="6" x2="6" y2="18"></line>
-                                            <line x1="6" y1="6" x2="18" y2="18"></line>
-                                        </svg>
-                                    </button>
-                                </div>
+                            <div class="flex items-center gap-2">
+                                <span class="text-lg" x-text="node.data.icon"></span>
+                                <span
+                                    class="font-bold tracking-tight cursor-text focus:outline-none focus:border-b focus:border-indigo-500"
+                                    :class="node.data.text" x-text="node.type" contenteditable="true"
+                                    @blur="node.type = $event.target.innerText"></span>
                             </div>
-                            <div class="p-4 bg-white rounded-b-xl">
-                                <label class="block text-xs font-semibold text-gray-500 uppercase mb-2">System
-                                    Prompt</label>
-                                <textarea x-model="node.data.system_prompt" rows="3"
-                                    class="w-full text-xs text-gray-600 border border-gray-200 rounded-md p-2 focus:ring-2 focus:ring-indigo-500 outline-none resize-none bg-gray-50"
-                                    @keydown.stop></textarea>
+                            <!-- Action Buttons -->
+                            <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button @click.stop="$store.workflow.openConfig(node.id)"
+                                    class="text-gray-400 hover:text-indigo-600 p-1 rounded hover:bg-white/50"
+                                    title="Settings">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+                                        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round">
+                                        <circle cx="12" cy="12" r="3"></circle>
+                                        <path
+                                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+                                        </path>
+                                    </svg>
+                                </button>
+                                <button
+                                    @click.stop="$store.workflow.selectedNode = node.id; $store.workflow.deleteSelected()"
+                                    class="text-gray-400 hover:text-red-500 p-1 rounded hover:bg-white/50"
+                                    title="Delete">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+                                        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round">
+                                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                                    </svg>
+                                </button>
                             </div>
                         </div>
-                    </template>
-                </div> <!-- End Transform Layer -->
-            </div>
-
-            <!-- Zoom Controls -->
-            <div class="absolute bottom-6 left-6 z-50 flex flex-col gap-2">
-                <div
-                    class="bg-white/90 backdrop-blur rounded-xl shadow-lg border border-gray-200 p-1 flex flex-col gap-1">
-                    <button @click="$store.workflow.setZoom($store.workflow.zoom + 0.1)"
-                        class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Zoom In">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
-                            stroke="currentColor" stroke-width="2">
-                            <line x1="12" y1="5" x2="12" y2="19"></line>
-                            <line x1="5" y1="12" x2="19" y2="12"></line>
-                        </svg>
-                    </button>
-                    <button @click="$store.workflow.centerCanvas()"
-                        class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Fit to Screen">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
-                            stroke="currentColor" stroke-width="2">
-                            <circle cx="12" cy="12" r="10"></circle>
-                            <circle cx="12" cy="12" r="3"></circle>
-                        </svg>
-                    </button>
-                    <button @click="$store.workflow.setZoom($store.workflow.zoom - 0.1)"
-                        class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Zoom Out">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
-                            stroke="currentColor" stroke-width="2">
-                            <line x1="5" y1="12" x2="19" y2="12"></line>
-                        </svg>
-                    </button>
-                </div>
-            </div>
-
-            <div class="absolute bottom-6 left-1/2 transform -translate-x-1/2 w-full max-w-2xl px-4 z-50">
-                <div
-                    class="bg-white/90 backdrop-blur-md rounded-2xl shadow-xl border border-gray-200 p-2 flex gap-2 items-center">
-                    <input type="text" x-model="$store.workflow.prompt" placeholder="Describe workflow task..."
-                        class="flex-1 bg-transparent border-none focus:ring-0 text-gray-700 placeholder-gray-400 text-sm h-10 px-2">
-                    <div x-show="!$store.workflow.isRunning && $store.workflow.reportContent"
-                        class="animate-fade-in-up">
-                        <button @click="$store.workflow.downloadReport()"
-                            class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2.5 rounded-xl font-medium text-sm transition-all"
-                            title="Download Report"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
-                                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                                stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                                <polyline points="7 10 12 15 17 10"></polyline>
-                                <line x1="12" y1="15" x2="12" y2="3"></line>
-                            </svg></button>
+                        <div class="p-4 bg-white rounded-b-xl">
+                            <label class="block text-xs font-semibold text-gray-500 uppercase mb-2">System
+                                Prompt</label>
+                            <textarea x-model="node.data.system_prompt" rows="3"
+                                class="w-full text-xs text-gray-600 border border-gray-200 rounded-md p-2 focus:ring-2 focus:ring-indigo-500 outline-none resize-none bg-gray-50"
+                                @keydown.stop></textarea>
+                        </div>
                     </div>
-                    <button @click="$store.workflow.runWorkflow()" :disabled="$store.workflow.isRunning"
-                        class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium shadow-sm transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
-                        <svg x-show="!$store.workflow.isRunning" xmlns="http://www.w3.org/2000/svg" width="16"
-                            height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                </template>
+            </div> <!-- End Transform Layer -->
+        </div>
+
+        <!-- Zoom Controls -->
+        <div
+            class="absolute bottom-6 left-6 z-40 bg-white/90 backdrop-blur-md rounded-xl shadow-lg border border-gray-200 p-1 flex items-center gap-1">
+            <button @click="$store.workflow.setZoom($store.workflow.zoom - 0.1)"
+                class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Zoom Out">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+            </button>
+            <span class="text-xs font-mono font-medium text-gray-500 w-12 text-center"
+                x-text="Math.round($store.workflow.zoom * 100) + '%'"></span>
+            <button @click="$store.workflow.setZoom($store.workflow.zoom + 0.1)"
+                class="p-2 hover:bg-gray-100 rounded-lg text-gray-600" title="Zoom In">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+            </button>
+        </div>
+
+        <!-- Add Agent FAB (Bottom Right) -->
+        <div class="absolute bottom-6 right-6 z-40" x-data="{ open: false }">
+            <div x-show="open"
+                class="absolute bottom-full right-0 mb-3 bg-white/90 backdrop-blur-md rounded-2xl shadow-xl border border-gray-200 p-2 flex flex-col gap-2 min-w-[160px] animate-fade-in-up origin-bottom-right"
+                style="display: none;" @click.outside="open = false">
+                <template x-for="agent in ['Researcher', 'Writer', 'Critic', 'Coder']">
+                    <button @click="$store.workflow.addNode(agent); open = false"
+                        class="flex items-center gap-3 w-full p-2 hover:bg-indigo-50 rounded-xl transition-colors group">
+                        <span class="text-lg group-hover:scale-110 transition-transform"
+                            x-text="{ 'Researcher': '🔍', 'Writer': '✍️', 'Critic': '🧐', 'Coder': '💻' }[agent]"></span>
+                        <span class="text-sm font-medium text-gray-700" x-text="agent"></span>
+                    </button>
+                </template>
+            </div>
+            <button @click="open = !open"
+                class="w-14 h-14 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full shadow-lg shadow-indigo-500/30 flex items-center justify-center transition-all hover:scale-105 active:scale-95">
+                <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                    :class="open ? 'rotate-45' : ''" class="transition-transform">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+            </button>
+        </div>
+
+        <div class="absolute bottom-6 left-1/2 transform -translate-x-1/2 w-full max-w-2xl px-4 z-50">
+            <div
+                class="bg-white/90 dark:bg-slate-800/90 backdrop-blur-md rounded-2xl shadow-xl border border-gray-200 dark:border-slate-700 p-2 flex items-center gap-2 transition-transform hover:scale-[1.01]">
+                <div class="p-2 bg-indigo-50 dark:bg-slate-700 text-indigo-600 dark:text-indigo-400 rounded-xl">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                </div>
+                <input type="text" x-model="$store.workflow.prompt"
+                    class="flex-1 bg-transparent border-none focus:ring-0 text-gray-700 dark:text-gray-200 placeholder-gray-400 text-sm font-medium"
+                    placeholder="Describe your workflow task..." @keydown.enter="$store.workflow.runWorkflow()">
+                <div x-show="!$store.workflow.isRunning && $store.workflow.reportContent" class="animate-fade-in-up">
+                    <button @click="$store.workflow.downloadReport()"
+                        class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg font-medium text-xs transition-all"
+                        title="Download Report"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
+                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                             stroke-linecap="round" stroke-linejoin="round">
-                            <polygon points="5 3 19 12 5 21 5 3"></polygon>
-                        </svg>
-                        <svg x-show="$store.workflow.isRunning" class="animate-spin -ml-1 mr-2 h-4 w-4 text-white"
-                            xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4">
-                            </circle>
-                            <path class="opacity-75" fill="currentColor"
-                                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
-                            </path>
-                        </svg>
-                        <span x-text="$store.workflow.isRunning ? 'Running...' : 'Run Workflow'"></span>
-                    </button>
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="7 10 12 15 17 10"></polyline>
+                            <line x1="12" y1="15" x2="12" y2="3"></line>
+                        </svg></button>
+                </div>
+                <div class="w-px h-8 bg-gray-200 dark:bg-slate-600 mx-2"></div>
+                <button @click="$store.workflow.runWorkflow()"
+                    :disabled="$store.workflow.nodes.length === 0 || ($store.workflow.isRunning && !$store.workflow.isPaused)"
+                    class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2.5 rounded-xl text-sm font-bold shadow-lg shadow-indigo-500/30 transition-all flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
 
-                    <div class="flex items-center gap-2 ml-4">
-                        <input type="checkbox" id="stepMode" x-model="$store.workflow.stepMode"
-                            class="text-indigo-600 rounded focus:ring-indigo-500">
-                        <label for="stepMode" class="text-xs text-gray-600 font-medium cursor-pointer select-none">Step
-                            Mode</label>
-                    </div>
+                    <!-- Play Icon (Default) -->
+                    <svg x-show="!$store.workflow.isRunning && !$store.workflow.isPaused"
+                        xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                    </svg>
+
+                    <!-- Resume Icon (Paused) -->
+                    <svg x-show="$store.workflow.isRunning && $store.workflow.isPaused"
+                        xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                        <line x1="5" y1="3" x2="5" y2="21"></line> <!-- visual hint for resume -->
+                    </svg>
+
+                    <!-- Spinner (Running) -->
+                    <svg x-show="$store.workflow.isRunning && !$store.workflow.isPaused"
+                        class="animate-spin -ml-1 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none"
+                        viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4">
+                        </circle>
+                        <path class="opacity-75" fill="currentColor"
+                            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
+                        </path>
+                    </svg>
+
+                    <span
+                        x-text="$store.workflow.isRunning ? ($store.workflow.isPaused ? 'Resume' : 'Running...') : 'Run Workflow'"></span>
+                </button>
+
+                <div class="flex items-center gap-2 ml-4">
+                    <input type="checkbox" id="stepMode" x-model="$store.workflow.stepMode"
+                        class="text-indigo-600 rounded focus:ring-indigo-500">
+                    <label for="stepMode" class="text-xs text-gray-600 font-medium cursor-pointer select-none">Step
+                        Mode</label>
                 </div>
             </div>
-        </main>
+        </div>
+    </main>
 
-        <aside class="w-80 bg-white border-l border-gray-200 flex flex-col shrink-0 z-10 shadow-lg">
-            <div class="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
-                <h2 class="text-xs font-bold text-gray-500 uppercase tracking-wider">Execution Logs</h2>
-                <button @click="$store.workflow.clearLogs()"
-                    class="text-xs text-gray-400 hover:text-gray-600">Clear</button>
-            </div>
-            <div id="logs-container" class="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50/30 scroll-smooth">
-                <template x-if="$store.workflow.logs.length === 0 && !$store.workflow.isRunning">
-                    <div class="h-64 flex flex-col items-center justify-center text-gray-300">
-                        <p class="text-sm">Ready to forge.</p>
-                    </div>
-                </template>
-                <template x-for="(log, index) in $store.workflow.logs" :key="index">
-                    <div class="flex gap-3 animate-fade-in-up">
-                        <div class="mt-1 flex-shrink-0">
-                            <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shadow-sm ring-2 ring-white"
-                                :class="{'bg-indigo-500': log.agent.includes('Researcher'), 'bg-teal-500': log.agent.includes('Writer'), 'bg-amber-500': log.agent.includes('Critic'), 'bg-violet-500': log.agent.includes('Coder'), 'bg-gray-400': !['Researcher', 'Writer', 'Critic', 'Coder'].some(r => log.agent.includes(r))}">
-                                <span x-text="log.agent[0]"></span>
-                            </div>
-                        </div>
-                        <div class="flex-1 relative group">
-                            <div class="flex items-baseline justify-between mb-1 pl-1"><span
-                                    class="text-xs font-bold text-gray-700" x-text="log.agent"></span><span
-                                    class="text-[10px] text-gray-400" x-text="log.timestamp"></span></div>
-                            <div class="bg-white p-3 rounded-2xl rounded-tl-none border border-gray-100 shadow-sm text-xs leading-relaxed"
-                                :class="{'border-red-100 bg-red-50': log.type === 'error', 'border-green-100 bg-green-50': log.type === 'success'}">
-                                <p class="text-gray-600 whitespace-pre-wrap" x-text="log.message"></p>
-                            </div>
+    <aside class="w-80 bg-white border-l border-gray-200 flex flex-col shrink-0 z-10 shadow-lg">
+        <div class="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+            <h2 class="text-xs font-bold text-gray-500 uppercase tracking-wider">Execution Logs</h2>
+            <button @click="$store.workflow.clearLogs()"
+                class="text-xs text-gray-400 hover:text-gray-600">Clear</button>
+        </div>
+        <div id="logs-container" class="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50/30 scroll-smooth">
+            <template x-if="$store.workflow.logs.length === 0 && !$store.workflow.isRunning">
+                <div class="h-64 flex flex-col items-center justify-center text-gray-300">
+                    <p class="text-sm">Ready to forge.</p>
+                </div>
+            </template>
+            <template x-for="(log, index) in $store.workflow.logs" :key="index">
+                <div class="flex gap-3 animate-fade-in-up">
+                    <div class="mt-1 flex-shrink-0">
+                        <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shadow-sm ring-2 ring-white"
+                            :class="{'bg-indigo-500': log.agent.includes('Researcher'), 'bg-teal-500': log.agent.includes('Writer'), 'bg-amber-500': log.agent.includes('Critic'), 'bg-violet-500': log.agent.includes('Coder'), 'bg-gray-400': !['Researcher', 'Writer', 'Critic', 'Coder'].some(r => log.agent.includes(r))}">
+                            <span x-text="log.agent[0]"></span>
                         </div>
                     </div>
-                </template>
-                <div x-show="$store.workflow.isRunning" class="flex gap-3 animate-fade-in-up opacity-80" x-transition>
-                    <div class="mt-1">
-                        <div
-                            class="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center ring-2 ring-white">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
-                                fill="none" stroke="currentColor" stroke-width="2" class="text-gray-400">
-                                <circle cx="12" cy="12" r="10"></circle>
-                                <polyline points="12 6 12 12 16 14"></polyline>
-                            </svg>
+                    <div class="flex-1 relative group">
+                        <div class="flex items-baseline justify-between mb-1 pl-1"><span
+                                class="text-xs font-bold text-gray-700" x-text="log.agent"></span><span
+                                class="text-[10px] text-gray-400" x-text="log.timestamp"></span></div>
+                        <div class="bg-white p-3 rounded-2xl rounded-tl-none border border-gray-100 shadow-sm text-xs leading-relaxed"
+                            :class="{'border-red-100 bg-red-50': log.type === 'error', 'border-green-100 bg-green-50': log.type === 'success'}">
+                            <p class="text-gray-600 whitespace-pre-wrap" x-text="log.message"></p>
                         </div>
-                    </div>
-                    <div
-                        class="bg-white p-3 rounded-2xl rounded-tl-none border border-gray-100 shadow-sm flex items-center gap-1 w-16">
-                        <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
-                        <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
-                        <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
                     </div>
                 </div>
+            </template>
+            <div x-show="$store.workflow.isRunning" class="flex gap-3 animate-fade-in-up opacity-80" x-transition>
+                <div class="mt-1">
+                    <div class="w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center ring-2 ring-white">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" class="text-gray-400">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <polyline points="12 6 12 12 16 14"></polyline>
+                        </svg>
+                    </div>
+                </div>
+                <div
+                    class="bg-white p-3 rounded-2xl rounded-tl-none border border-gray-100 shadow-sm flex items-center gap-1 w-16">
+                    <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
+                    <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
+                    <div class="w-1.5 h-1.5 bg-gray-400 rounded-full typing-dot"></div>
+                </div>
             </div>
-        </aside>
+        </div>
+    </aside>
     </div>
     <!-- Config Panel -->
     <div x-show="$store.workflow.showConfigPanel" class="fixed inset-0 z-50 overflow-hidden" style="display: none;">
